@@ -7,7 +7,26 @@ from datetime import datetime, time as dtime
 # ======================
 # 🔐 UPSTOX TOKEN
 # ======================
-ACCESS_TOKEN = st.secrets["UPSTOX_TOKEN"]
+try:
+    ACCESS_TOKEN = st.secrets["UPSTOX_TOKEN"]
+except KeyError:
+    st.error("""
+## ⚠️ Missing Secret: UPSTOX_TOKEN
+
+Your Upstox API token has not been configured.
+
+**To fix this on Streamlit Cloud:**
+1. Go to your app → click **⋮ (three dots)** in the bottom-right → **Settings**
+2. Click the **Secrets** tab
+3. Paste the following and replace with your real token:
+
+```toml
+UPSTOX_TOKEN = "your_upstox_access_token_here"
+```
+
+4. Click **Save** — the app will restart automatically.
+""")
+    st.stop()
 
 # ======================
 # 🕒 MARKET TIME
