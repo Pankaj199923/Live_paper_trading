@@ -1,47 +1,64 @@
-# QuantDesk Pro — Modular Structure
+# QuantDesk Pro — Options Terminal
 
-## File Overview
+A Bloomberg-style live options trading terminal built with Streamlit + Upstox API.
 
-| File | Lines | Purpose |
-|------|-------|---------|
-| `app.py` | ~391 | Main entry point — page config, CSS, session state, header, tab routing |
-| `config.py` | ~96 | Constants — token, timezone, index config, file paths, lot sizes |
-| `utils.py` | ~332 | Utility functions — CSV helpers, ATM/lot helpers, position calc, snapshot, UI components |
-| `api.py` | ~155 | API fetch functions with `@st.cache_data` — LTP, expiries, option chain, intraday candles |
-| `analytics.py` | ~638 | Computation — Black-Scholes, Greeks, IV, signal scores, AI trade gen, alerts, Claude setup |
-| `chart_utils.py` | ~420 | Charting — technicals, order flow, liquidity sweeps, order blocks, FVG, BOS/CHOCH |
-| `tab1_option_chain.py` | ~195 | Tab 1 — Live Option Chain |
-| `tab2_smart_money.py` | ~307 | Tab 2 — Smart Money + GEX |
-| `tab3_positions.py` | ~161 | Tab 3 — Positions & Net Book |
-| `tab4_snr_pain.py` | ~140 | Tab 4 — S&R + Max Pain |
-| `tab5_ai_advisor.py` | ~441 | Tab 5 — AI Advisor |
-| `tab6_trade_log.py` | ~133 | Tab 6 — Trade Log |
-| `tab7_greeks_lab.py` | ~124 | Tab 7 — Greeks Lab |
-| `tab8_stocks.py` | ~195 | Tab 8 — Stocks Terminal |
-| `tab9_chart.py` | ~704 | Tab 9 — Live Chart + Order Flow |
-| `tab10_history.py` | ~325 | Tab 10 — Option Chain History |
-| `tab11_basket.py` | ~373 | Tab 11 — Basket Trade Builder |
+## 🚀 Deploy on Streamlit Community Cloud
 
-## Dependency Graph
+### 1. Push to GitHub
+Make sure your repo contains **all files including `NSECMI.csv`**.
 
-```
-app.py
-  ├── config.py          (constants, secrets)
-  ├── utils.py           (helpers)  → config
-  ├── api.py             (fetchers) → config
-  ├── analytics.py       (math/AI)  → config, utils
-  ├── chart_utils.py     (charts)   → (pure pandas/numpy)
-  └── tab*.py            (UI tabs)  → config, utils, api, analytics, chart_utils
+### 2. Connect on share.streamlit.io
+- Go to [share.streamlit.io](https://share.streamlit.io)
+- Click **New app**
+- Select your GitHub repo
+- Set **Main file path** → `app.py`
+- Click **Deploy**
+
+### 3. Add your secret token
+After deploy, go to **⋮ → Settings → Secrets** and paste:
+
+```toml
+UPSTOX_TOKEN = "your_upstox_access_token_here"
 ```
 
-## Run
+Then click **Save** — the app will restart automatically.
+
+---
+
+## 🗂 File Structure
+
+| File | Purpose |
+|------|---------|
+| `app.py` | Entry point — run this |
+| `config.py` | Constants, token, index config |
+| `utils.py` | CSV helpers, UI components |
+| `api.py` | Upstox API fetch functions |
+| `analytics.py` | Black-Scholes, signals, Greeks |
+| `chart_utils.py` | Technicals, order flow, ICT |
+| `tab1_option_chain.py` | Live Option Chain |
+| `tab2_smart_money.py` | Smart Money + GEX |
+| `tab3_positions.py` | Positions & Net Book |
+| `tab4_snr_pain.py` | S&R + Max Pain |
+| `tab5_ai_advisor.py` | AI Signal Engine |
+| `tab6_trade_log.py` | Trade Log |
+| `tab7_greeks_lab.py` | Greeks Lab |
+| `tab8_stocks.py` | Stocks Terminal |
+| `tab9_chart.py` | Live Chart + Order Flow |
+| `tab10_history.py` | Option Chain History |
+| `tab11_basket.py` | Basket Trade Builder |
+| `NSECMI.csv` | NSE instrument master (required for Stocks tab) |
+
+## ⚠️ Important Notes
+
+- **`NSECMI.csv`** must be in the repo root (same folder as `app.py`)
+- **Never commit** `.streamlit/secrets.toml` — it's in `.gitignore`
+- The `oc_snapshots/` folder is created automatically at runtime
+- Runtime CSVs (`executed_trades.csv`, etc.) are **ephemeral** on Community Cloud — they reset on each redeploy. For persistent trade history, use an external DB.
+
+## Local Development
 
 ```bash
+pip install -r requirements.txt
+# Add your token to .streamlit/secrets.toml
 streamlit run app.py
 ```
-
-## Notes
-- Each tab is a module with a single `render()` function called by `app.py`
-- All shared constants live in `config.py` — update expiry dates, lot sizes, etc. there
-- All `@st.cache_data` fetch functions are in `api.py`
-- To add a new tab: create `tab12_name.py` with a `render()` function, then import and wire it in `app.py`

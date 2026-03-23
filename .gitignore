@@ -1,0 +1,27 @@
+# ── Secrets — NEVER commit ──────────────────
+.streamlit/secrets.toml
+
+# ── Python cache ────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# ── Runtime data (regenerated at runtime) ───
+executed_trades.csv
+today_trades.csv
+closed_positions.csv
+ai_trade_log.csv
+oc_snapshots/
+
+# ── OS / IDE ────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# ── Env ─────────────────────────────────────
+.env
+venv/
+.venv/
