@@ -261,22 +261,21 @@ def calculate_max_pain(oc):
 # ======================
 def calculate_portfolio_greeks(trades, spot_price, index_key, days_to_expiry):
     """Aggregate greeks across all open positions."""
-    from scipy.stats import norm as _norm
-    import numpy as _np
 
     def _bs_greeks(S, K, T, r, sigma, opt='c'):
+        from scipy.stats import norm as _norm
+        import numpy as _np
         if sigma <= 0 or T <= 0:
             return {"delta": 0, "gamma": 0, "theta": 0, "vega": 0}
-        d1 = (_np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * _np.sqrt(T))
-        d2 = d1 - sigma * _np.sqrt(T)
-        nd1 = _norm.pdf(d1)
+        d1    = (_np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * _np.sqrt(T))
+        d2    = d1 - sigma * _np.sqrt(T)
+        nd1   = _norm.pdf(d1)
         delta = _norm.cdf(d1) if opt == 'c' else _norm.cdf(d1) - 1
         gamma = nd1 / (S * sigma * _np.sqrt(T))
         vega  = S * nd1 * _np.sqrt(T) / 100
-        theta = (-(S * nd1 * sigma) / (2 * _np.sqrt(T)) -
-                 r * K * _np.exp(-r * T) * (_norm.cdf(d2) if opt == 'c' else _norm.cdf(-d2))) / 365
-        return {"delta": round(delta, 4), "gamma": round(gamma, 6),
-                "theta": round(theta, 4), "vega":  round(vega, 4)}
+        cdf2  = _norm.cdf(d2) if opt == 'c' else _norm.cdf(-d2)
+        theta = (-(S * nd1 * sigma) / (2 * _np.sqrt(T)) - r * K * _np.exp(-r * T) * cdf2) / 365
+        return {"delta": round(delta, 4), "gamma": round(gamma, 6), "theta": round(theta, 4), "vega": round(vega, 4)}
 
     T = max(days_to_expiry, 1) / 365
     r = 0.065
