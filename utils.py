@@ -261,26 +261,42 @@ def calculate_max_pain(oc):
 # ======================
 def calculate_portfolio_greeks(trades, spot_price, index_key, days_to_expiry):
     """Aggregate greeks across all open positions."""
+    from scipy.stats import norm as _norm
+    import numpy as _np
+
+    def _bs_greeks(S, K, T, r, sigma, opt='c'):
+        if sigma <= 0 or T <= 0:
+            return {"delta": 0, "gamma": 0, "theta": 0, "vega": 0}
+        d1 = (_np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * _np.sqrt(T))
+        d2 = d1 - sigma * _np.sqrt(T)
+        nd1 = _norm.pdf(d1)
+        delta = _norm.cdf(d1) if opt == 'c' else _norm.cdf(d1) - 1
+        gamma = nd1 / (S * sigma * _np.sqrt(T))
+        vega  = S * nd1 * _np.sqrt(T) / 100
+        theta = (-(S * nd1 * sigma) / (2 * _np.sqrt(T)) -
+                 r * K * _np.exp(-r * T) * (_norm.cdf(d2) if opt == 'c' else _norm.cdf(-d2))) / 365
+        return {"delta": round(delta, 4), "gamma": round(gamma, 6),
+                "theta": round(theta, 4), "vega":  round(vega, 4)}
+
     T = max(days_to_expiry, 1) / 365
     r = 0.065
     net_delta = net_gamma = net_theta = net_vega = 0
     for trade in trades:
         if trade.get("Status") != "OPEN": continue
         K      = float(trade.get("Strike", spot_price))
-        entry  = float(trade.get("Entry", 0))
         qty    = float(trade.get("Qty", 1))
         action = trade.get("Action", "SELL")
         opt_t  = trade.get("Type", "CE")
-        iv_est = 0.2  # fallback; ideally from option chain
+        iv_est = 0.2  # fallback IV
         sign   = 1 if action == "BUY" else -1
         opt_bs = 'c' if opt_t == "CE" else 'p'
-        g      = bs_greeks(spot_price, K, T, r, iv_est, opt_bs)
+        g      = _bs_greeks(spot_price, K, T, r, iv_est, opt_bs)
         net_delta += sign * g['delta'] * qty
         net_gamma += sign * g['gamma'] * qty
         net_theta += sign * g['theta'] * qty
         net_vega  += sign * g['vega']  * qty
-    return {"Δ Delta": round(net_delta,2), "Γ Gamma": round(net_gamma,4),
-            "Θ Theta": round(net_theta,2), "V Vega":  round(net_vega,2)}
+    return {"Δ Delta": round(net_delta, 2), "Γ Gamma": round(net_gamma, 4),
+            "Θ Theta": round(net_theta, 2), "V Vega":  round(net_vega, 2)}
 
 # ======================
 # 🤖 PRO AI TRADE GENERATOR — Defined-Risk Strategies
