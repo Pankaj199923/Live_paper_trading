@@ -429,7 +429,7 @@ def render():
                 total_pe_oi_vs = float(oc_vs["PE_OI"].sum())
                 total_oi_sum   = total_ce_oi_vs + total_pe_oi_vs
                 oi_diff_pct    = abs(total_ce_oi_vs - total_pe_oi_vs) / max(total_oi_sum, 1) * 100
-                if oi_diff_pct < 20:
+                if oi_diff_pct < 10:
                     oi_bias, oi_bias_color = "⚪ NEUTRAL",  "#7fa8c8"
                 elif total_ce_oi_vs > total_pe_oi_vs:
                     oi_bias, oi_bias_color = "🔴 BEARISH",  "#ff3d57"
