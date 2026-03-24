@@ -612,61 +612,62 @@ def render():
     sel_sb  = st.session_state.get("current_selected_index")
     spot_sb = st.session_state.get("current_spot_price")
 
-    if not oc_sb.empty and sel_sb and MARKET_OPEN:
+    if not oc_sb.empty and sel_sb and spot_sb:
         lot_sb      = get_lot_size(sel_sb)
-    strikes_sb  = sorted(oc_sb['Strike'].unique())
-    atm_sb      = get_atm_strike(spot_sb, sel_sb)
-    try:    atm_idx_sb = strikes_sb.index(atm_sb)
-    except: atm_idx_sb = 0
+        strikes_sb  = sorted(oc_sb['Strike'].unique())
+        atm_sb      = get_atm_strike(spot_sb, sel_sb)
+        try:    atm_idx_sb = strikes_sb.index(atm_sb)
+        except: atm_idx_sb = 0
 
-    strike_sb   = st.sidebar.selectbox("Strike", strikes_sb, index=atm_idx_sb, key="sb_strike")
-    opt_type_sb = st.sidebar.radio("Option Type", ["CE", "PE"], horizontal=True, key="sb_opt")
-    action_sb   = st.sidebar.radio("Action", ["BUY", "SELL"], horizontal=True, key="sb_action")
-    qty_sb      = st.sidebar.number_input("Qty", min_value=lot_sb, value=lot_sb, step=lot_sb, key="sb_qty")
-    lots_cnt_sb = qty_sb // lot_sb
+        strike_sb   = st.sidebar.selectbox("Strike", strikes_sb, index=atm_idx_sb, key="sb_strike")
+        opt_type_sb = st.sidebar.radio("Option Type", ["CE", "PE"], horizontal=True, key="sb_opt")
+        action_sb   = st.sidebar.radio("Action", ["BUY", "SELL"], horizontal=True, key="sb_action")
+        qty_sb      = st.sidebar.number_input("Qty", min_value=lot_sb, value=lot_sb, step=lot_sb, key="sb_qty")
+        lots_cnt_sb = qty_sb // lot_sb
 
-    row_sb     = oc_sb[oc_sb['Strike'] == strike_sb].iloc[0]
-    cur_price_sb = float(row_sb['CE_LTP' if opt_type_sb == "CE" else 'PE_LTP'])
+        row_sb       = oc_sb[oc_sb['Strike'] == strike_sb].iloc[0]
+        cur_price_sb = float(row_sb['CE_LTP' if opt_type_sb == "CE" else 'PE_LTP'])
 
-    sb_color = "#00e676" if action_sb == "BUY" else "#ff3d57"
-    st.sidebar.markdown(f"""
-    <div style="background:#0d1117;border:1px solid {sb_color};border-radius:3px;
-                padding:10px;margin:8px 0;font-family:'JetBrains Mono',monospace;font-size:12px;">
-      <div style="color:#7fa8c8;">LTP</div>
-      <div style="color:{sb_color};font-size:20px;font-weight:700;">₹{cur_price_sb:.2f}</div>
-      <div style="color:#7fa8c8;font-size:11px;">{lots_cnt_sb} Lot{'s' if lots_cnt_sb > 1 else ''} = {qty_sb} units</div>
-      {"<div style='color:#ffd600;font-size:11px;font-weight:700;'>★ ATM</div>" if strike_sb == atm_sb else ""}
-    </div>""", unsafe_allow_html=True)
+        sb_color = "#00e676" if action_sb == "BUY" else "#ff3d57"
+        st.sidebar.markdown(f"""
+        <div style="background:#0d1117;border:1px solid {sb_color};border-radius:3px;
+                    padding:10px;margin:8px 0;font-family:'JetBrains Mono',monospace;font-size:12px;">
+          <div style="color:#7fa8c8;">LTP</div>
+          <div style="color:{sb_color};font-size:20px;font-weight:700;">₹{cur_price_sb:.2f}</div>
+          <div style="color:#7fa8c8;font-size:11px;">{lots_cnt_sb} Lot{'s' if lots_cnt_sb > 1 else ''} = {qty_sb} units</div>
+          {"<div style='color:#ffd600;font-size:11px;font-weight:700;'>★ ATM</div>" if strike_sb == atm_sb else ""}
+        </div>""", unsafe_allow_html=True)
 
-    # Risk preview
-    if action_sb == "SELL":
-        max_loss_preview = cur_price_sb * 2 * lot_sb  # rough estimate
-        st.sidebar.markdown(f"""<div style="font-family:'Barlow Condensed',sans-serif;
-            font-size:11px;color:#ff3d57;letter-spacing:1px;">EST. MAX RISK ≈ ₹{max_loss_preview:,.0f}</div>""",
-            unsafe_allow_html=True)
+        # Risk preview
+        if action_sb == "SELL":
+            max_loss_preview = cur_price_sb * 2 * lot_sb  # rough estimate
+            st.sidebar.markdown(f"""<div style="font-family:'Barlow Condensed',sans-serif;
+                font-size:11px;color:#ff3d57;letter-spacing:1px;">EST. MAX RISK ≈ ₹{max_loss_preview:,.0f}</div>""",
+                unsafe_allow_html=True)
 
-    if st.sidebar.button("✅ EXECUTE", use_container_width=True, type="primary"):
-        _, _, grand_sb = compute_grand_total()
-        if grand_sb <= st.session_state.daily_loss_limit:
-            st.sidebar.error("🔴 Daily loss limit hit.")
+        if MARKET_OPEN:
+            if st.sidebar.button("✅ EXECUTE", use_container_width=True, type="primary"):
+                _, _, grand_sb = compute_grand_total()
+                if grand_sb <= st.session_state.daily_loss_limit:
+                    st.sidebar.error("🔴 Daily loss limit hit.")
+                else:
+                    trade_sb = {
+                        "Entry_Time": datetime.now(IST).strftime("%H:%M:%S"),
+                        "Date": datetime.now().strftime("%Y-%m-%d"),
+                        "Index": sel_sb, "Strike": strike_sb,
+                        "Type": opt_type_sb, "Action": action_sb,
+                        "Qty": qty_sb, "Entry": cur_price_sb, "Status": "OPEN"
+                    }
+                    st.session_state.today_trades.append(trade_sb)
+                    save_list_to_csv(st.session_state.today_trades, TODAY_TRADES_FILE)
+                    st.sidebar.success(f"✅ {action_sb} {opt_type_sb} @ {strike_sb}")
+                    st.rerun()
         else:
-            trade_sb = {
-                "Entry_Time": datetime.now(IST).strftime("%H:%M:%S"),
-                "Date": datetime.now().strftime("%Y-%m-%d"),
-                "Index": sel_sb, "Strike": strike_sb,
-                "Type": opt_type_sb, "Action": action_sb,
-                "Qty": qty_sb, "Entry": cur_price_sb, "Status": "OPEN"
-            }
-            st.session_state.today_trades.append(trade_sb)
-            save_list_to_csv(st.session_state.today_trades, TODAY_TRADES_FILE)
-            st.sidebar.success(f"✅ {action_sb} {opt_type_sb} @ {strike_sb}")
-            st.rerun()
-
-    elif not MARKET_OPEN:
-        st.sidebar.markdown(f"""<div style="background:#1a0a00;border:1px solid #ff8c00;
-        border-radius:3px;padding:8px 12px;font-family:'Barlow Condensed',sans-serif;
-        font-size:13px;color:#ff8c00;letter-spacing:1px;">🔴 MARKET {session_label}</div>""",
-        unsafe_allow_html=True)
+            session_label = st.session_state.get("session_label", "CLOSED")
+            st.sidebar.markdown(f"""<div style="background:#1a0a00;border:1px solid #ff8c00;
+            border-radius:3px;padding:8px 12px;font-family:'Barlow Condensed',sans-serif;
+            font-size:13px;color:#ff8c00;letter-spacing:1px;">🔴 MARKET {session_label}</div>""",
+            unsafe_allow_html=True)
     else:
         st.sidebar.info("⏳ Load option chain from Tab 1")
 
