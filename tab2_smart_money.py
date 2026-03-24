@@ -424,23 +424,51 @@ def render():
                             "type": "DANGER"
                         })
 
-                # Summary metrics
-                sv1, sv2, sv3 = st.columns(3)
+                # ── Total OI comparison with 20% rule ────────────────────
+                total_ce_oi_vs = float(oc_vs["CE_OI"].sum())
+                total_pe_oi_vs = float(oc_vs["PE_OI"].sum())
+                total_oi_sum   = total_ce_oi_vs + total_pe_oi_vs
+                oi_diff_pct    = abs(total_ce_oi_vs - total_pe_oi_vs) / max(total_oi_sum, 1) * 100
+                if oi_diff_pct < 20:
+                    oi_bias, oi_bias_color = "⚪ NEUTRAL",  "#7fa8c8"
+                elif total_ce_oi_vs > total_pe_oi_vs:
+                    oi_bias, oi_bias_color = "🔴 BEARISH",  "#ff3d57"
+                else:
+                    oi_bias, oi_bias_color = "🟢 BULLISH",  "#00e676"
+
+                # ── 5-card summary row ────────────────────────────────────
+                sv1, sv2, sv3, sv4, sv5 = st.columns(5)
                 with sv1:
                     st.markdown(f"""<div style="background:#0d1117;border:1px solid #1e3040;border-left:3px solid #ff3d57;
                         border-radius:3px;padding:10px 14px;">
-                        <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;letter-spacing:2px;color:#7fa8c8;">CE SPIKES</div>
-                        <div style="font-family:'JetBrains Mono',monospace;font-size:22px;font-weight:700;color:#ff3d57;">{len(ce_spikes)}</div>
-                        <div style="font-size:10px;color:#3a6080;">strikes above {spike_threshold:.0f}× avg</div>
+                        <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;letter-spacing:2px;color:#7fa8c8;">TOTAL CE OI</div>
+                        <div style="font-family:'JetBrains Mono',monospace;font-size:16px;font-weight:700;color:#ff3d57;">{total_ce_oi_vs/1e5:.1f}L</div>
+                        <div style="font-size:10px;color:#3a6080;">CE Spikes: {len(ce_spikes)} strikes</div>
                         </div>""", unsafe_allow_html=True)
                 with sv2:
                     st.markdown(f"""<div style="background:#0d1117;border:1px solid #1e3040;border-left:3px solid #00e676;
                         border-radius:3px;padding:10px 14px;">
-                        <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;letter-spacing:2px;color:#7fa8c8;">PE SPIKES</div>
-                        <div style="font-family:'JetBrains Mono',monospace;font-size:22px;font-weight:700;color:#00e676;">{len(pe_spikes)}</div>
-                        <div style="font-size:10px;color:#3a6080;">strikes above {spike_threshold:.0f}× avg</div>
+                        <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;letter-spacing:2px;color:#7fa8c8;">TOTAL PE OI</div>
+                        <div style="font-family:'JetBrains Mono',monospace;font-size:16px;font-weight:700;color:#00e676;">{total_pe_oi_vs/1e5:.1f}L</div>
+                        <div style="font-size:10px;color:#3a6080;">PE Spikes: {len(pe_spikes)} strikes</div>
                         </div>""", unsafe_allow_html=True)
                 with sv3:
+                    st.markdown(f"""<div style="background:#0d1117;border:1px solid #1e3040;border-left:3px solid {oi_bias_color};
+                        border-radius:3px;padding:10px 14px;">
+                        <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;letter-spacing:2px;color:#7fa8c8;">OI NET BIAS</div>
+                        <div style="font-family:'Barlow Condensed',sans-serif;font-size:15px;font-weight:700;color:{oi_bias_color};margin-top:2px;">{oi_bias}</div>
+                        <div style="font-size:10px;color:#3a6080;">Diff: {oi_diff_pct:.1f}% {'> 20% threshold' if oi_diff_pct >= 20 else '< 20% → Neutral'}</div>
+                        </div>""", unsafe_allow_html=True)
+                with sv4:
+                    pcr_vs = round(total_pe_oi_vs / max(total_ce_oi_vs, 1), 3)
+                    pcr_c  = "#00e676" if pcr_vs > 1.2 else "#ff3d57" if pcr_vs < 0.8 else "#ffd600"
+                    st.markdown(f"""<div style="background:#0d1117;border:1px solid #1e3040;border-left:3px solid {pcr_c};
+                        border-radius:3px;padding:10px 14px;">
+                        <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;letter-spacing:2px;color:#7fa8c8;">PCR (OI)</div>
+                        <div style="font-family:'JetBrains Mono',monospace;font-size:22px;font-weight:700;color:{pcr_c};">{pcr_vs:.3f}</div>
+                        <div style="font-size:10px;color:#3a6080;">PE÷CE OI ratio</div>
+                        </div>""", unsafe_allow_html=True)
+                with sv5:
                     top_spike = max(spike_alerts, key=lambda x: float(x["vs Avg"].replace("×","")))
                     st.markdown(f"""<div style="background:#0d1117;border:1px solid #1e3040;border-left:3px solid #ffd600;
                         border-radius:3px;padding:10px 14px;">
@@ -449,6 +477,19 @@ def render():
                             {top_spike['Type']} {top_spike['Strike']}</div>
                         <div style="font-size:11px;color:#ff8c00;">{top_spike['vs Avg']} of avg volume</div>
                         </div>""", unsafe_allow_html=True)
+
+                # ── OI comparison bar ────────────────────────────────────
+                ce_pct_bar = total_ce_oi_vs / max(total_oi_sum, 1) * 100
+                pe_pct_bar = 100 - ce_pct_bar
+                st.markdown(f"""
+                <div style="margin:10px 0 4px 0;font-family:'Barlow Condensed',sans-serif;
+                            font-size:9px;letter-spacing:1.5px;color:#3a6080;">
+                  TOTAL OI SPLIT — CE {ce_pct_bar:.1f}% vs PE {pe_pct_bar:.1f}%
+                </div>
+                <div style="display:flex;height:8px;border-radius:4px;overflow:hidden;margin-bottom:12px;">
+                  <div style="width:{ce_pct_bar:.1f}%;background:#ff3d57;"></div>
+                  <div style="width:{pe_pct_bar:.1f}%;background:#00e676;"></div>
+                </div>""", unsafe_allow_html=True)
 
                 st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
                 st.dataframe(
