@@ -7,7 +7,7 @@ import anthropic as _anthropic
 from datetime import datetime
 from config import (TF_OPTIONS, TF_RESAMPLE, ACCESS_TOKEN, IST, now_ist_dt, INDEX_SHORT, LOT_SIZES,
                     AI_LOG_FILE, TRADE_FILE, TODAY_TRADES_FILE)
-from utils import load_csv_safe, save_list_to_csv, idx_short, get_lot_size, get_atm_strike
+from utils import load_csv_safe, save_list_to_csv, idx_short, get_lot_size, get_atm_strike, compute_grand_total
 
 # ======================
 # 📐 BLACK-SCHOLES
