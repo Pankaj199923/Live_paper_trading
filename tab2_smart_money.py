@@ -305,18 +305,34 @@ def render():
                 ce_cls, ce_col, ce_signal = _classify(r["CE_OI_Change"], r["CE_LTP"], "CE")
                 pe_cls, pe_col, pe_signal = _classify(r["PE_OI_Change"], r["PE_LTP"], "PE")
                 atm_tag = " ★" if r["Strike"] == atm_bu else ""
+
+                # Net Bias rule:
+                # CE OI Chg > PE OI Chg by >20%  → BEARISH (more call writing = resistance)
+                # PE OI Chg > CE OI Chg by >20%  → BULLISH (more put writing = support)
+                # Difference <20%                 → NEUTRAL
+                ce_chg    = abs(float(r["CE_OI_Change"]))
+                pe_chg    = abs(float(r["PE_OI_Change"]))
+                total_chg = ce_chg + pe_chg
+                if total_chg == 0:
+                    net_bias = "⚪ NEUT"
+                else:
+                    diff_pct = abs(ce_chg - pe_chg) / max(total_chg, 1) * 100
+                    if diff_pct < 20:
+                        net_bias = "⚪ NEUT"
+                    elif ce_chg > pe_chg:
+                        net_bias = "🔴 BEAR"   # More CE OI added → bearish
+                    else:
+                        net_bias = "🟢 BULL"   # More PE OI added → bullish
+
                 rows_bu.append({
-                    "Strike":       f"{int(r['Strike']):,}{atm_tag}",
-                    "CE OI Chg":    f"{r['CE_OI_Change']/1e3:+.1f}K",
-                    "CE Activity":  ce_cls,
-                    "CE Signal":    ce_signal,
-                    "PE OI Chg":    f"{r['PE_OI_Change']/1e3:+.1f}K",
-                    "PE Activity":  pe_cls,
-                    "PE Signal":    pe_signal,
-                    "Net Bias":     "🟢 BULL" if (ce_cls in ("Long Build",) or pe_cls == "Short Cover") and
-                                               not (ce_cls == "Short Build" or pe_cls == "Long Unwind")
-                                    else "🔴 BEAR" if (ce_cls == "Long Unwind" or pe_cls == "Short Build")
-                                    else "⚪ NEUT",
+                    "Strike":      f"{int(r['Strike']):,}{atm_tag}",
+                    "CE OI Chg":   f"{r['CE_OI_Change']/1e3:+.1f}K",
+                    "CE Activity": ce_cls,
+                    "CE Signal":   ce_signal,
+                    "PE OI Chg":   f"{r['PE_OI_Change']/1e3:+.1f}K",
+                    "PE Activity": pe_cls,
+                    "PE Signal":   pe_signal,
+                    "Net Bias":    net_bias,
                 })
 
             df_bu = pd.DataFrame(rows_bu)
