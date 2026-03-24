@@ -373,28 +373,42 @@ def render():
 
             atm_vs = get_atm_strike(spot2, sel_idx2)
 
+            def _spike_bias(ce_chg, pe_chg):
+                """CE OI Chg vs PE OI Chg with 20% threshold — same rule as OI Buildup."""
+                ce_abs = abs(float(ce_chg)); pe_abs = abs(float(pe_chg))
+                total  = ce_abs + pe_abs
+                if total == 0: return "⚪ NEUTRAL"
+                diff_pct = abs(ce_abs - pe_abs) / max(total, 1) * 100
+                if diff_pct < 20:   return "⚪ NEUTRAL"
+                elif ce_abs > pe_abs: return "🔴 BEARISH"
+                else:                 return "🟢 BULLISH"
+
             spike_alerts = []
             for _, r in ce_spikes.iterrows():
-                mult = r["CE_Volume"] / max(avg_ce_vol, 1)
-                rel  = "ITM" if r["Strike"] < spot2 else "OTM" if r["Strike"] > spot2 else "ATM"
+                mult   = r["CE_Volume"] / max(avg_ce_vol, 1)
+                rel    = "ITM" if r["Strike"] < spot2 else "OTM" if r["Strike"] > spot2 else "ATM"
+                ce_chg = r.get("CE_OI_Change", 0); pe_chg = r.get("PE_OI_Change", 0)
                 spike_alerts.append({
                     "Type": "CE 🔴", "Strike": int(r["Strike"]),
                     "Volume": f"{int(r['CE_Volume']):,}",
                     "vs Avg": f"{mult:.1f}×",
-                    "OI Chg": f"{r.get('CE_OI_Change', 0)/1e3:+.1f}K",
+                    "CE OI Chg": f"{ce_chg/1e3:+.1f}K",
+                    "PE OI Chg": f"{pe_chg/1e3:+.1f}K",
                     "Moneyness": rel,
-                    "Implication": "⚠️ Buying CE (Bullish)" if r.get("CE_OI_Change", 0) > 0 else "⚠️ Writing CE (Bearish cap)",
+                    "Net Bias": _spike_bias(ce_chg, pe_chg),
                 })
             for _, r in pe_spikes.iterrows():
-                mult = r["PE_Volume"] / max(avg_pe_vol, 1)
-                rel  = "ITM" if r["Strike"] > spot2 else "OTM" if r["Strike"] < spot2 else "ATM"
+                mult   = r["PE_Volume"] / max(avg_pe_vol, 1)
+                rel    = "ITM" if r["Strike"] > spot2 else "OTM" if r["Strike"] < spot2 else "ATM"
+                ce_chg = r.get("CE_OI_Change", 0); pe_chg = r.get("PE_OI_Change", 0)
                 spike_alerts.append({
                     "Type": "PE 🟢", "Strike": int(r["Strike"]),
                     "Volume": f"{int(r['PE_Volume']):,}",
                     "vs Avg": f"{mult:.1f}×",
-                    "OI Chg": f"{r.get('PE_OI_Change', 0)/1e3:+.1f}K",
+                    "CE OI Chg": f"{ce_chg/1e3:+.1f}K",
+                    "PE OI Chg": f"{pe_chg/1e3:+.1f}K",
                     "Moneyness": rel,
-                    "Implication": "⚠️ Buying PE (Bearish)" if r.get("PE_OI_Change", 0) > 0 else "⚠️ Writing PE (Bullish floor)",
+                    "Net Bias": _spike_bias(ce_chg, pe_chg),
                 })
 
             if spike_alerts:
@@ -442,13 +456,14 @@ def render():
                     use_container_width=True,
                     height=min(35 * len(df_spikes) + 38, 420),
                     column_config={
-                        "Type":        st.column_config.TextColumn("Type",        width=70),
-                        "Strike":      st.column_config.NumberColumn("Strike",     format="%d", width=80),
-                        "Volume":      st.column_config.TextColumn("Volume",       width=90),
-                        "vs Avg":      st.column_config.TextColumn("vs Avg",       width=65),
-                        "OI Chg":      st.column_config.TextColumn("OI Δ",         width=70),
-                        "Moneyness":   st.column_config.TextColumn("Money",        width=60),
-                        "Implication": st.column_config.TextColumn("Implication",  width=200),
+                        "Type":       st.column_config.TextColumn("Type",      width=70),
+                        "Strike":     st.column_config.NumberColumn("Strike",   format="%d", width=80),
+                        "Volume":     st.column_config.TextColumn("Volume",     width=100),
+                        "vs Avg":     st.column_config.TextColumn("vs Avg",     width=65),
+                        "CE OI Chg":  st.column_config.TextColumn("CE OI Δ",   width=85),
+                        "PE OI Chg":  st.column_config.TextColumn("PE OI Δ",   width=85),
+                        "Moneyness":  st.column_config.TextColumn("Money",      width=60),
+                        "Net Bias":   st.column_config.TextColumn("Net Bias",   width=100),
                     }
                 )
 
