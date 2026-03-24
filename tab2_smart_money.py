@@ -379,7 +379,7 @@ def render():
                 total  = ce_abs + pe_abs
                 if total == 0: return "⚪ NEUTRAL"
                 diff_pct = abs(ce_abs - pe_abs) / max(total, 1) * 100
-                if diff_pct < 20:   return "⚪ NEUTRAL"
+                if diff_pct < 10:   return "⚪ NEUTRAL"
                 elif ce_abs > pe_abs: return "🔴 BEARISH"
                 else:                 return "🟢 BULLISH"
 
