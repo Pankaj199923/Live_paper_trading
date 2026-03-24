@@ -293,7 +293,10 @@ def render():
             ), row=1, col=1)
 
         # Absorption markers (gold diamond)
-        _abs9 = of_df9[of_df9["absorption"]]
+        if "absorption" in of_df9.columns:
+            _abs9 = of_df9[of_df9["absorption"]]
+        else:
+            _abs9 = of_df9.iloc[0:0]  # empty frame
         if not _abs9.empty:
             fig9.add_trace(go.Scatter(
                 x=_abs9["timestamp"], y=_abs9["low"] * 0.9995,
@@ -303,7 +306,7 @@ def render():
             ), row=1, col=1)
 
         # Bull divergence (hidden selling) markers
-        _bd9 = of_df9[of_df9["bull_div"]]
+        _bd9 = of_df9[of_df9["bull_div"]] if "bull_div" in of_df9.columns else of_df9.iloc[0:0]
         if not _bd9.empty:
             fig9.add_trace(go.Scatter(
                 x=_bd9["timestamp"], y=_bd9["high"] * 1.0003,
@@ -313,7 +316,7 @@ def render():
             ), row=1, col=1)
 
         # Bear divergence (hidden buying) markers
-        _brd9 = of_df9[of_df9["bear_div"]]
+        _brd9 = of_df9[of_df9["bear_div"]] if "bear_div" in of_df9.columns else of_df9.iloc[0:0]
         if not _brd9.empty:
             fig9.add_trace(go.Scatter(
                 x=_brd9["timestamp"], y=_brd9["low"] * 0.9997,
