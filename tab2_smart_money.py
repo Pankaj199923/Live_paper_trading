@@ -457,7 +457,7 @@ def render():
                         border-radius:3px;padding:10px 14px;">
                         <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;letter-spacing:2px;color:#7fa8c8;">OI NET BIAS</div>
                         <div style="font-family:'Barlow Condensed',sans-serif;font-size:15px;font-weight:700;color:{oi_bias_color};margin-top:2px;">{oi_bias}</div>
-                        <div style="font-size:10px;color:#3a6080;">Diff: {oi_diff_pct:.1f}% {'> 20% threshold' if oi_diff_pct >= 20 else '< 20% → Neutral'}</div>
+                        <div style="font-size:10px;color:#3a6080;">Diff: {oi_diff_pct:.1f}% {'> 10% threshold' if oi_diff_pct >= 10 else '< 10% → Neutral'}</div>
                         </div>""", unsafe_allow_html=True)
                 with sv4:
                     pcr_vs = round(total_pe_oi_vs / max(total_ce_oi_vs, 1), 3)
