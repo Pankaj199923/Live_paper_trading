@@ -190,6 +190,290 @@ def render():
     except ImportError:
         st.info("pip install plotly for OI heatmap")
 
+    # ======================================================
+    # CHANGE IN OI CHART — CE vs PE per strike
+    # ======================================================
+    st.markdown("---")
+    section_header("Change in OI by Strike", "CE (red) vs PE (green) — net OI added/removed this session")
+    try:
+        oc_chg = oc2.sort_values("Strike").copy()
+        if "CE_OI_Change" in oc_chg.columns and "PE_OI_Change" in oc_chg.columns:
+            atm_strike_chg = get_atm_strike(spot2, sel_idx2)
+            # Focus on ±10 strikes around ATM for readability
+            strikes_all = sorted(oc_chg["Strike"].unique())
+            if atm_strike_chg in strikes_all:
+                ai_chg = strikes_all.index(atm_strike_chg)
+                focus_strikes = strikes_all[max(0, ai_chg - 10): ai_chg + 11]
+                oc_chg = oc_chg[oc_chg["Strike"].isin(focus_strikes)]
+
+            chg_fig = go.Figure()
+            chg_fig.add_bar(
+                x=oc_chg["Strike"], y=oc_chg["CE_OI_Change"] / 1e3,
+                name="CE OI Chg", marker_color="#ff3d57", opacity=0.85
+            )
+            chg_fig.add_bar(
+                x=oc_chg["Strike"], y=oc_chg["PE_OI_Change"] / 1e3,
+                name="PE OI Chg", marker_color="#00e676", opacity=0.85
+            )
+            # Highlight ATM
+            chg_fig.add_vline(
+                x=float(atm_strike_chg), line_color="#00d4ff",
+                line_dash="dot", line_width=1.5,
+                annotation_text="ATM", annotation_font_color="#00d4ff", annotation_font_size=10
+            )
+            # Zero line
+            chg_fig.add_hline(y=0, line_color="#3a6080", line_width=0.8)
+            chg_fig.update_layout(
+                barmode="group", height=300,
+                paper_bgcolor="#070b0f", plot_bgcolor="#070b0f",
+                font=dict(family="JetBrains Mono", color="#7fa8c8", size=11),
+                margin=dict(l=40, r=20, t=20, b=40),
+                xaxis=dict(gridcolor="#1e3040", tickangle=-45, tickformat="d", title="Strike"),
+                yaxis=dict(gridcolor="#1e3040", title="OI Change (000s)"),
+                legend=dict(bgcolor="rgba(0,0,0,0)", font_color="#7fa8c8"),
+            )
+            st.plotly_chart(chg_fig, use_container_width=True)
+
+            # Net OI Change summary
+            total_ce_chg = oc2["CE_OI_Change"].sum()
+            total_pe_chg = oc2["PE_OI_Change"].sum()
+            net_chg_bias = "🟢 PE ADDING (BULLISH)" if total_pe_chg > total_ce_chg else "🔴 CE ADDING (BEARISH)"
+            c1c, c2c, c3c = st.columns(3)
+            with c1c:
+                st.markdown(f"""<div style="background:#0d1117;border:1px solid #1e3040;border-left:3px solid #ff3d57;
+                    border-radius:3px;padding:10px 14px;">
+                    <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;letter-spacing:2px;color:#7fa8c8;">TOTAL CE OI CHG</div>
+                    <div style="font-family:'JetBrains Mono',monospace;font-size:18px;font-weight:700;
+                        color:{'#00e676' if total_ce_chg > 0 else '#ff3d57'};">{total_ce_chg/1e3:+.0f}K</div>
+                    </div>""", unsafe_allow_html=True)
+            with c2c:
+                st.markdown(f"""<div style="background:#0d1117;border:1px solid #1e3040;border-left:3px solid #00e676;
+                    border-radius:3px;padding:10px 14px;">
+                    <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;letter-spacing:2px;color:#7fa8c8;">TOTAL PE OI CHG</div>
+                    <div style="font-family:'JetBrains Mono',monospace;font-size:18px;font-weight:700;
+                        color:{'#00e676' if total_pe_chg > 0 else '#ff3d57'};">{total_pe_chg/1e3:+.0f}K</div>
+                    </div>""", unsafe_allow_html=True)
+            with c3c:
+                st.markdown(f"""<div style="background:#0d1117;border:1px solid #1e3040;border-left:3px solid #ffd600;
+                    border-radius:3px;padding:10px 14px;">
+                    <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;letter-spacing:2px;color:#7fa8c8;">NET BIAS</div>
+                    <div style="font-family:'Barlow Condensed',sans-serif;font-size:14px;font-weight:700;color:#ffd600;">{net_chg_bias}</div>
+                    </div>""", unsafe_allow_html=True)
+        else:
+            st.info("OI Change data not available in current option chain.")
+    except Exception as e:
+        st.warning(f"OI Change chart error: {e}")
+
+    # ======================================================
+    # OI BUILDUP TABLE — Long/Short Build/Unwind per strike
+    # ======================================================
+    st.markdown("---")
+    section_header("OI Buildup Analysis", "Classify institutional activity per strike: Long Build · Short Cover · Long Unwind · Short Build")
+    try:
+        oc_bu = oc2.copy()
+        if all(c in oc_bu.columns for c in ["CE_OI_Change", "PE_OI_Change", "CE_LTP", "PE_LTP"]):
+
+            def _classify(oi_chg, ltp_chg_proxy, side):
+                """
+                OI up + price up   → Long Build   (bullish)
+                OI up + price down → Short Build  (bearish)
+                OI down + price up → Short Cover  (bullish)
+                OI down + price dn → Long Unwind  (bearish)
+                Using OI change sign as proxy for price direction (CE rises when market bullish).
+                """
+                if side == "CE":
+                    if oi_chg > 0:
+                        return ("Long Build",  "#00e676", "↑ BULL")
+                    else:
+                        return ("Long Unwind", "#ff3d57", "↓ BEAR")
+                else:  # PE
+                    if oi_chg > 0:
+                        return ("Short Build", "#ff3d57", "↓ BEAR")
+                    else:
+                        return ("Short Cover", "#00e676", "↑ BULL")
+
+            rows_bu = []
+            atm_bu = get_atm_strike(spot2, sel_idx2)
+            strikes_bu = sorted(oc_bu["Strike"].unique())
+            if atm_bu in strikes_bu:
+                ai_bu = strikes_bu.index(atm_bu)
+                focus_bu = strikes_bu[max(0, ai_bu - 7): ai_bu + 8]
+            else:
+                focus_bu = strikes_bu[:15]
+
+            for _, r in oc_bu[oc_bu["Strike"].isin(focus_bu)].iterrows():
+                ce_cls, ce_col, ce_signal = _classify(r["CE_OI_Change"], r["CE_LTP"], "CE")
+                pe_cls, pe_col, pe_signal = _classify(r["PE_OI_Change"], r["PE_LTP"], "PE")
+                atm_tag = " ★" if r["Strike"] == atm_bu else ""
+                rows_bu.append({
+                    "Strike":       f"{int(r['Strike']):,}{atm_tag}",
+                    "CE OI Chg":    f"{r['CE_OI_Change']/1e3:+.1f}K",
+                    "CE Activity":  ce_cls,
+                    "CE Signal":    ce_signal,
+                    "PE OI Chg":    f"{r['PE_OI_Change']/1e3:+.1f}K",
+                    "PE Activity":  pe_cls,
+                    "PE Signal":    pe_signal,
+                    "Net Bias":     "🟢 BULL" if (ce_cls in ("Long Build",) or pe_cls == "Short Cover") and
+                                               not (ce_cls == "Short Build" or pe_cls == "Long Unwind")
+                                    else "🔴 BEAR" if (ce_cls == "Long Unwind" or pe_cls == "Short Build")
+                                    else "⚪ NEUT",
+                })
+
+            df_bu = pd.DataFrame(rows_bu)
+            st.dataframe(
+                df_bu,
+                use_container_width=True,
+                height=min(35 * len(df_bu) + 38, 480),
+                column_config={
+                    "Strike":      st.column_config.TextColumn("Strike", width=90),
+                    "CE OI Chg":   st.column_config.TextColumn("CE OI Δ", width=85),
+                    "CE Activity": st.column_config.TextColumn("CE Activity", width=110),
+                    "CE Signal":   st.column_config.TextColumn("CE Signal", width=75),
+                    "PE OI Chg":   st.column_config.TextColumn("PE OI Δ", width=85),
+                    "PE Activity": st.column_config.TextColumn("PE Activity", width=110),
+                    "PE Signal":   st.column_config.TextColumn("PE Signal", width=75),
+                    "Net Bias":    st.column_config.TextColumn("Net Bias", width=90),
+                }
+            )
+        else:
+            st.info("OI Change columns not available.")
+    except Exception as e:
+        st.warning(f"OI Buildup error: {e}")
+
+    # ======================================================
+    # VOLUME SPIKE ALERTS
+    # ======================================================
+    st.markdown("---")
+    section_header("🚨 Volume Spike Alerts", "Strikes where CE or PE volume is 2× or more above average — unusual institutional activity")
+    try:
+        oc_vs = oc2.copy()
+        if "CE_Volume" in oc_vs.columns and "PE_Volume" in oc_vs.columns:
+            avg_ce_vol = oc_vs["CE_Volume"].mean()
+            avg_pe_vol = oc_vs["PE_Volume"].mean()
+            spike_threshold = 2.0  # 2× average
+
+            ce_spikes = oc_vs[oc_vs["CE_Volume"] >= avg_ce_vol * spike_threshold].copy()
+            pe_spikes = oc_vs[oc_vs["PE_Volume"] >= avg_pe_vol * spike_threshold].copy()
+
+            atm_vs = get_atm_strike(spot2, sel_idx2)
+
+            spike_alerts = []
+            for _, r in ce_spikes.iterrows():
+                mult = r["CE_Volume"] / max(avg_ce_vol, 1)
+                rel  = "ITM" if r["Strike"] < spot2 else "OTM" if r["Strike"] > spot2 else "ATM"
+                spike_alerts.append({
+                    "Type": "CE 🔴", "Strike": int(r["Strike"]),
+                    "Volume": f"{int(r['CE_Volume']):,}",
+                    "vs Avg": f"{mult:.1f}×",
+                    "OI Chg": f"{r.get('CE_OI_Change', 0)/1e3:+.1f}K",
+                    "Moneyness": rel,
+                    "Implication": "⚠️ Buying CE (Bullish)" if r.get("CE_OI_Change", 0) > 0 else "⚠️ Writing CE (Bearish cap)",
+                })
+            for _, r in pe_spikes.iterrows():
+                mult = r["PE_Volume"] / max(avg_pe_vol, 1)
+                rel  = "ITM" if r["Strike"] > spot2 else "OTM" if r["Strike"] < spot2 else "ATM"
+                spike_alerts.append({
+                    "Type": "PE 🟢", "Strike": int(r["Strike"]),
+                    "Volume": f"{int(r['PE_Volume']):,}",
+                    "vs Avg": f"{mult:.1f}×",
+                    "OI Chg": f"{r.get('PE_OI_Change', 0)/1e3:+.1f}K",
+                    "Moneyness": rel,
+                    "Implication": "⚠️ Buying PE (Bearish)" if r.get("PE_OI_Change", 0) > 0 else "⚠️ Writing PE (Bullish floor)",
+                })
+
+            if spike_alerts:
+                df_spikes = pd.DataFrame(spike_alerts).sort_values("Strike")
+                # Fire toast for very high spikes (>3×)
+                high_spikes = [a for a in spike_alerts if float(a["vs Avg"].replace("×","")) >= 3.0]
+                for hs in high_spikes[:3]:
+                    st.toast(f"🚨 Vol Spike {hs['Type']} {hs['Strike']} — {hs['vs Avg']} avg", icon="🔔")
+                    if "alert_log" in st.session_state:
+                        st.session_state.alert_log.append({
+                            "time": datetime.now(IST).strftime("%H:%M:%S"),
+                            "msg":  f"Vol Spike {hs['Type']} {hs['Strike']} ({hs['vs Avg']})",
+                            "type": "DANGER"
+                        })
+
+                # Summary metrics
+                sv1, sv2, sv3 = st.columns(3)
+                with sv1:
+                    st.markdown(f"""<div style="background:#0d1117;border:1px solid #1e3040;border-left:3px solid #ff3d57;
+                        border-radius:3px;padding:10px 14px;">
+                        <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;letter-spacing:2px;color:#7fa8c8;">CE SPIKES</div>
+                        <div style="font-family:'JetBrains Mono',monospace;font-size:22px;font-weight:700;color:#ff3d57;">{len(ce_spikes)}</div>
+                        <div style="font-size:10px;color:#3a6080;">strikes above {spike_threshold:.0f}× avg</div>
+                        </div>""", unsafe_allow_html=True)
+                with sv2:
+                    st.markdown(f"""<div style="background:#0d1117;border:1px solid #1e3040;border-left:3px solid #00e676;
+                        border-radius:3px;padding:10px 14px;">
+                        <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;letter-spacing:2px;color:#7fa8c8;">PE SPIKES</div>
+                        <div style="font-family:'JetBrains Mono',monospace;font-size:22px;font-weight:700;color:#00e676;">{len(pe_spikes)}</div>
+                        <div style="font-size:10px;color:#3a6080;">strikes above {spike_threshold:.0f}× avg</div>
+                        </div>""", unsafe_allow_html=True)
+                with sv3:
+                    top_spike = max(spike_alerts, key=lambda x: float(x["vs Avg"].replace("×","")))
+                    st.markdown(f"""<div style="background:#0d1117;border:1px solid #1e3040;border-left:3px solid #ffd600;
+                        border-radius:3px;padding:10px 14px;">
+                        <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;letter-spacing:2px;color:#7fa8c8;">BIGGEST SPIKE</div>
+                        <div style="font-family:'JetBrains Mono',monospace;font-size:16px;font-weight:700;color:#ffd600;">
+                            {top_spike['Type']} {top_spike['Strike']}</div>
+                        <div style="font-size:11px;color:#ff8c00;">{top_spike['vs Avg']} of avg volume</div>
+                        </div>""", unsafe_allow_html=True)
+
+                st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+                st.dataframe(
+                    df_spikes,
+                    use_container_width=True,
+                    height=min(35 * len(df_spikes) + 38, 420),
+                    column_config={
+                        "Type":        st.column_config.TextColumn("Type",        width=70),
+                        "Strike":      st.column_config.NumberColumn("Strike",     format="%d", width=80),
+                        "Volume":      st.column_config.TextColumn("Volume",       width=90),
+                        "vs Avg":      st.column_config.TextColumn("vs Avg",       width=65),
+                        "OI Chg":      st.column_config.TextColumn("OI Δ",         width=70),
+                        "Moneyness":   st.column_config.TextColumn("Money",        width=60),
+                        "Implication": st.column_config.TextColumn("Implication",  width=200),
+                    }
+                )
+
+                # Volume spike chart
+                vs_fig = go.Figure()
+                oc_sorted_vs = oc_vs.sort_values("Strike")
+                vs_fig.add_bar(
+                    x=oc_sorted_vs["Strike"],
+                    y=oc_sorted_vs["CE_Volume"] / 1e3,
+                    name="CE Volume", marker_color="#ff3d57", opacity=0.75
+                )
+                vs_fig.add_bar(
+                    x=oc_sorted_vs["Strike"],
+                    y=oc_sorted_vs["PE_Volume"] / 1e3,
+                    name="PE Volume", marker_color="#00e676", opacity=0.75
+                )
+                vs_fig.add_hline(y=avg_ce_vol * spike_threshold / 1e3,
+                                  line_color="#ff8c00", line_dash="dash", line_width=1.2,
+                                  annotation_text=f"CE {spike_threshold:.0f}× threshold",
+                                  annotation_font_color="#ff8c00", annotation_font_size=9)
+                vs_fig.add_hline(y=avg_pe_vol * spike_threshold / 1e3,
+                                  line_color="#00d4ff", line_dash="dash", line_width=1.2,
+                                  annotation_text=f"PE {spike_threshold:.0f}× threshold",
+                                  annotation_font_color="#00d4ff", annotation_font_size=9)
+                vs_fig.update_layout(
+                    barmode="group", height=280,
+                    paper_bgcolor="#070b0f", plot_bgcolor="#070b0f",
+                    font=dict(family="JetBrains Mono", color="#7fa8c8", size=11),
+                    margin=dict(l=40, r=20, t=10, b=40),
+                    xaxis=dict(gridcolor="#1e3040", tickangle=-45, tickformat="d"),
+                    yaxis=dict(gridcolor="#1e3040", title="Volume (000s)"),
+                    legend=dict(bgcolor="rgba(0,0,0,0)", font_color="#7fa8c8"),
+                )
+                st.plotly_chart(vs_fig, use_container_width=True)
+            else:
+                st.success("✅ No unusual volume spikes detected — market activity is normal.")
+        else:
+            st.info("Volume data not available in current option chain.")
+    except Exception as e:
+        st.warning(f"Volume spike error: {e}")
+
 
     # ======================================================
     # SIDEBAR — MANUAL TRADE EXECUTION
