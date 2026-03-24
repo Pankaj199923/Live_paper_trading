@@ -322,17 +322,12 @@ def render():
             bull_count    = sum(1 for r in rows_cmp if "BULLISH" in r["Net Bias"])
             bear_count    = sum(1 for r in rows_cmp if "BEARISH" in r["Net Bias"])
             neut_count    = len(rows_cmp) - bull_count - bear_count
-            total_signals = bull_count + bear_count
-            if total_signals == 0:
-                overall_bias = "⚪ NEUTRAL"
+            if bull_count > bear_count:
+                overall_bias = "🟢 BULLISH"
+            elif bear_count > bull_count:
+                overall_bias = "🔴 BEARISH"
             else:
-                ob_diff_pct = abs(bull_count - bear_count) / max(total_signals, 1) * 100
-                if ob_diff_pct < 15:
-                    overall_bias = "⚪ NEUTRAL"
-                elif bull_count > bear_count:
-                    overall_bias = "🟢 BULLISH"
-                else:
-                    overall_bias = "🔴 BEARISH"
+                overall_bias = "⚪ NEUTRAL"
             ob_color      = "#00e676" if "BULL" in overall_bias else ("#ff3d57" if "BEAR" in overall_bias else "#7fa8c8")
 
             mc1, mc2, mc3, mc4, mc5 = st.columns(5)
