@@ -191,99 +191,27 @@ def render():
         st.info("pip install plotly for OI heatmap")
 
     # ======================================================
-    # CHANGE IN OI CHART — CE vs PE per strike
+    # CE vs PE OI COMPARISON — Single chart + strike-wise Net Bias table
     # ======================================================
     st.markdown("---")
-    section_header("Change in OI by Strike", "CE (red) vs PE (green) — net OI added/removed this session")
-    try:
-        oc_chg = oc2.sort_values("Strike").copy()
-        if "CE_OI_Change" in oc_chg.columns and "PE_OI_Change" in oc_chg.columns:
-            atm_strike_chg = get_atm_strike(spot2, sel_idx2)
-            # Focus on ±10 strikes around ATM for readability
-            strikes_all = sorted(oc_chg["Strike"].unique())
-            if atm_strike_chg in strikes_all:
-                ai_chg = strikes_all.index(atm_strike_chg)
-                focus_strikes = strikes_all[max(0, ai_chg - 10): ai_chg + 11]
-                oc_chg = oc_chg[oc_chg["Strike"].isin(focus_strikes)]
-
-            chg_fig = go.Figure()
-            chg_fig.add_bar(
-                x=oc_chg["Strike"], y=oc_chg["CE_OI_Change"] / 1e3,
-                name="CE OI Chg", marker_color="#ff3d57", opacity=0.85
-            )
-            chg_fig.add_bar(
-                x=oc_chg["Strike"], y=oc_chg["PE_OI_Change"] / 1e3,
-                name="PE OI Chg", marker_color="#00e676", opacity=0.85
-            )
-            # Highlight ATM
-            chg_fig.add_vline(
-                x=float(atm_strike_chg), line_color="#00d4ff",
-                line_dash="dot", line_width=1.5,
-                annotation_text="ATM", annotation_font_color="#00d4ff", annotation_font_size=10
-            )
-            # Zero line
-            chg_fig.add_hline(y=0, line_color="#3a6080", line_width=0.8)
-            chg_fig.update_layout(
-                barmode="group", height=300,
-                paper_bgcolor="#070b0f", plot_bgcolor="#070b0f",
-                font=dict(family="JetBrains Mono", color="#7fa8c8", size=11),
-                margin=dict(l=40, r=20, t=20, b=40),
-                xaxis=dict(gridcolor="#1e3040", tickangle=-45, tickformat="d", title="Strike"),
-                yaxis=dict(gridcolor="#1e3040", title="OI Change (000s)"),
-                legend=dict(bgcolor="rgba(0,0,0,0)", font_color="#7fa8c8"),
-            )
-            st.plotly_chart(chg_fig, use_container_width=True)
-
-            # Net OI Change summary
-            total_ce_chg = oc2["CE_OI_Change"].sum()
-            total_pe_chg = oc2["PE_OI_Change"].sum()
-            net_chg_bias = "🟢 PE ADDING (BULLISH)" if total_pe_chg > total_ce_chg else "🔴 CE ADDING (BEARISH)"
-            c1c, c2c, c3c = st.columns(3)
-            with c1c:
-                st.markdown(f"""<div style="background:#0d1117;border:1px solid #1e3040;border-left:3px solid #ff3d57;
-                    border-radius:3px;padding:10px 14px;">
-                    <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;letter-spacing:2px;color:#7fa8c8;">TOTAL CE OI CHG</div>
-                    <div style="font-family:'JetBrains Mono',monospace;font-size:18px;font-weight:700;
-                        color:{'#00e676' if total_ce_chg > 0 else '#ff3d57'};">{total_ce_chg/1e3:+.0f}K</div>
-                    </div>""", unsafe_allow_html=True)
-            with c2c:
-                st.markdown(f"""<div style="background:#0d1117;border:1px solid #1e3040;border-left:3px solid #00e676;
-                    border-radius:3px;padding:10px 14px;">
-                    <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;letter-spacing:2px;color:#7fa8c8;">TOTAL PE OI CHG</div>
-                    <div style="font-family:'JetBrains Mono',monospace;font-size:18px;font-weight:700;
-                        color:{'#00e676' if total_pe_chg > 0 else '#ff3d57'};">{total_pe_chg/1e3:+.0f}K</div>
-                    </div>""", unsafe_allow_html=True)
-            with c3c:
-                st.markdown(f"""<div style="background:#0d1117;border:1px solid #1e3040;border-left:3px solid #ffd600;
-                    border-radius:3px;padding:10px 14px;">
-                    <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;letter-spacing:2px;color:#7fa8c8;">NET BIAS</div>
-                    <div style="font-family:'Barlow Condensed',sans-serif;font-size:14px;font-weight:700;color:#ffd600;">{net_chg_bias}</div>
-                    </div>""", unsafe_allow_html=True)
-        else:
-            st.info("OI Change data not available in current option chain.")
-    except Exception as e:
-        st.warning(f"OI Change chart error: {e}")
-
-    # ======================================================
-    # CE vs PE OI COMPARISON TABLE — per strike with Net Bias
-    # ======================================================
-    st.markdown("---")
-    section_header("CE vs PE OI per Strike", "Side-by-side CE OI Δ and PE OI Δ with Net Bias — spot institutional conviction at each strike")
+    section_header("CE vs PE OI per Strike", "OI Δ chart + strike-wise CE OI vs PE OI Net Bias — institutional conviction at each strike")
     try:
         oc_cmp = oc2.copy()
         if all(c in oc_cmp.columns for c in ["CE_OI", "PE_OI", "CE_OI_Change", "PE_OI_Change"]):
-            atm_cmp    = get_atm_strike(spot2, sel_idx2)
-            strikes_cmp= sorted(oc_cmp["Strike"].unique())
+            atm_cmp     = get_atm_strike(spot2, sel_idx2)
+            strikes_cmp = sorted(oc_cmp["Strike"].unique())
             if atm_cmp in strikes_cmp:
-                ai_cmp     = strikes_cmp.index(atm_cmp)
-                focus_cmp  = strikes_cmp[max(0, ai_cmp - 7): ai_cmp + 8]
+                ai_cmp    = strikes_cmp.index(atm_cmp)
+                focus_cmp = strikes_cmp[max(0, ai_cmp - 7): ai_cmp + 8]
             else:
-                focus_cmp  = strikes_cmp[:15]
+                focus_cmp = strikes_cmp[:15]
 
             oc_cmp = oc_cmp[oc_cmp["Strike"].isin(focus_cmp)].sort_values("Strike")
 
-            # ── Bar chart: CE OI Δ vs PE OI Δ side-by-side ──────────────
-            try:
+            # ── Tab view: OI Δ chart | Total OI chart ──────────────────────
+            tab_oi_delta, tab_oi_total = st.tabs(["📊 OI Change (Δ) by Strike", "📈 Total CE OI vs PE OI"])
+
+            with tab_oi_delta:
                 cmp_fig = go.Figure()
                 ce_colors = ["#ff3d57" if v >= 0 else "#ff8a80" for v in oc_cmp["CE_OI_Change"]]
                 pe_colors = ["#00e676" if v >= 0 else "#69f0ae" for v in oc_cmp["PE_OI_Change"]]
@@ -313,47 +241,89 @@ def render():
                     yaxis=dict(gridcolor="#1e3040", title="OI Change (000s)"),
                     legend=dict(bgcolor="rgba(0,0,0,0)", font_color="#7fa8c8"),
                 )
-                st.plotly_chart(cmp_fig, use_container_width=True)
-            except Exception as e:
-                st.warning(f"CE vs PE OI chart error: {e}")
+                st.plotly_chart(cmp_fig, use_container_width=True, key="oi_delta_chart")
 
-            # ── Table: Strike | CE OI | CE OI Δ | PE OI Δ | PE OI | Net Bias ──
-            def _net_bias_cmp(ce_chg, pe_chg):
-                ce_abs = abs(float(ce_chg)); pe_abs = abs(float(pe_chg))
-                total  = ce_abs + pe_abs
-                if total == 0: return "⚪ NEUTRAL"
-                diff_pct = abs(ce_abs - pe_abs) / max(total, 1) * 100
-                if diff_pct < 15:       return "⚪ NEUTRAL"
-                elif ce_abs > pe_abs:   return "🔴 BEARISH"
-                else:                   return "🟢 BULLISH"
+            with tab_oi_total:
+                tot_fig = go.Figure()
+                tot_fig.add_bar(
+                    x=oc_cmp["Strike"], y=oc_cmp["CE_OI"] / 1e5,
+                    name="CE OI", marker_color="#ff3d57", opacity=0.85,
+                )
+                tot_fig.add_bar(
+                    x=oc_cmp["Strike"], y=oc_cmp["PE_OI"] / 1e5,
+                    name="PE OI", marker_color="#00e676", opacity=0.85,
+                )
+                tot_fig.add_vline(
+                    x=float(atm_cmp), line_color="#00d4ff", line_dash="dot", line_width=1.5,
+                    annotation_text="ATM", annotation_font_color="#00d4ff", annotation_font_size=10
+                )
+                tot_fig.update_layout(
+                    barmode="group", height=320,
+                    paper_bgcolor="#070b0f", plot_bgcolor="#070b0f",
+                    font=dict(family="JetBrains Mono", color="#7fa8c8", size=11),
+                    margin=dict(l=40, r=20, t=20, b=40),
+                    xaxis=dict(gridcolor="#1e3040", tickangle=-45, tickformat="d", title="Strike"),
+                    yaxis=dict(gridcolor="#1e3040", title="OI (Lakhs)"),
+                    legend=dict(bgcolor="rgba(0,0,0,0)", font_color="#7fa8c8"),
+                )
+                st.plotly_chart(tot_fig, use_container_width=True, key="oi_total_chart")
+
+            # ── Net Bias: based on CE_OI vs PE_OI (total OI dominance) ──────
+            # Logic: whichever side has more OI dominates conviction at that strike
+            # CE OI > PE OI  → more call writing / bearish hedging → BEARISH
+            # PE OI > CE OI  → more put writing / bullish support   → BULLISH
+            # Difference < 15% of total → NEUTRAL
+            def _net_bias_oi(ce_oi, pe_oi, ce_chg, pe_chg):
+                ce_oi = abs(float(ce_oi)); pe_oi = abs(float(pe_oi))
+                total_oi = ce_oi + pe_oi
+                if total_oi == 0:
+                    return "⚪ NEUTRAL"
+                oi_diff_pct = abs(ce_oi - pe_oi) / max(total_oi, 1) * 100
+                # OI dominance
+                if oi_diff_pct < 15:
+                    oi_verdict = "⚪ NEUTRAL"
+                elif ce_oi > pe_oi:
+                    oi_verdict = "🔴 BEARISH"  # CE OI dominates → resistance / call selling
+                else:
+                    oi_verdict = "🟢 BULLISH"  # PE OI dominates → support / put selling
+                return oi_verdict
 
             rows_cmp = []
             for _, r in oc_cmp.iterrows():
-                atm_tag = " ★ATM" if r["Strike"] == atm_cmp else ""
-                money   = "ATM" if r["Strike"] == atm_cmp else ("ITM" if r["Strike"] < spot2 else "OTM")
+                atm_tag   = " ★" if r["Strike"] == atm_cmp else ""
+                money     = "ATM" if r["Strike"] == atm_cmp else ("ITM" if r["Strike"] < spot2 else "OTM")
+                ce_oi     = float(r["CE_OI"])
+                pe_oi     = float(r["PE_OI"])
                 ce_oi_chg = float(r["CE_OI_Change"])
                 pe_oi_chg = float(r["PE_OI_Change"])
+                total_oi  = ce_oi + pe_oi
+                ce_oi_pct = ce_oi / max(total_oi, 1) * 100
+                pe_oi_pct = 100 - ce_oi_pct
                 rows_cmp.append({
                     "Strike":    f"{int(r['Strike']):,}{atm_tag}",
-                    "CE OI":     f"{float(r['CE_OI'])/1e5:.2f}L",
+                    "CE OI":     f"{ce_oi/1e5:.2f}L",
                     "CE OI Δ":   f"{ce_oi_chg/1e3:+.1f}K",
+                    "CE %":      f"{ce_oi_pct:.0f}%",
+                    "PE %":      f"{pe_oi_pct:.0f}%",
                     "PE OI Δ":   f"{pe_oi_chg/1e3:+.1f}K",
-                    "PE OI":     f"{float(r['PE_OI'])/1e5:.2f}L",
+                    "PE OI":     f"{pe_oi/1e5:.2f}L",
                     "Money":     money,
-                    "Net Bias":  _net_bias_cmp(ce_oi_chg, pe_oi_chg),
+                    "Net Bias":  _net_bias_oi(ce_oi, pe_oi, ce_oi_chg, pe_oi_chg),
                 })
 
             df_cmp = pd.DataFrame(rows_cmp)
 
-            # Summary metrics above the table
-            total_ce_cmp = oc_cmp["CE_OI_Change"].sum()
-            total_pe_cmp = oc_cmp["PE_OI_Change"].sum()
-            pcr_cmp      = oc_cmp["PE_OI"].sum() / max(oc_cmp["CE_OI"].sum(), 1)
-            bull_count   = sum(1 for r in rows_cmp if "BULLISH" in r["Net Bias"])
-            bear_count   = sum(1 for r in rows_cmp if "BEARISH" in r["Net Bias"])
-            neut_count   = len(rows_cmp) - bull_count - bear_count
-            overall_bias = "🟢 BULLISH" if bull_count > bear_count else ("🔴 BEARISH" if bear_count > bull_count else "⚪ NEUTRAL")
-            ob_color     = "#00e676" if "BULL" in overall_bias else ("#ff3d57" if "BEAR" in overall_bias else "#7fa8c8")
+            # ── Summary metrics ──────────────────────────────────────────────
+            total_ce_cmp  = oc_cmp["CE_OI_Change"].sum()
+            total_pe_cmp  = oc_cmp["PE_OI_Change"].sum()
+            total_ce_oi   = oc_cmp["CE_OI"].sum()
+            total_pe_oi   = oc_cmp["PE_OI"].sum()
+            pcr_cmp       = total_pe_oi / max(total_ce_oi, 1)
+            bull_count    = sum(1 for r in rows_cmp if "BULLISH" in r["Net Bias"])
+            bear_count    = sum(1 for r in rows_cmp if "BEARISH" in r["Net Bias"])
+            neut_count    = len(rows_cmp) - bull_count - bear_count
+            overall_bias  = "🟢 BULLISH" if bull_count > bear_count else ("🔴 BEARISH" if bear_count > bull_count else "⚪ NEUTRAL")
+            ob_color      = "#00e676" if "BULL" in overall_bias else ("#ff3d57" if "BEAR" in overall_bias else "#7fa8c8")
 
             mc1, mc2, mc3, mc4, mc5 = st.columns(5)
             with mc1:
@@ -376,33 +346,49 @@ def render():
                     border-radius:3px;padding:10px 14px;">
                     <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;letter-spacing:2px;color:#7fa8c8;">PCR (OI)</div>
                     <div style="font-family:'JetBrains Mono',monospace;font-size:18px;font-weight:700;color:{pcr_c};">{pcr_cmp:.2f}</div>
+                    <div style="font-size:10px;color:#3a6080;">{'Bullish' if pcr_cmp > 1.2 else 'Bearish' if pcr_cmp < 0.8 else 'Neutral'}</div>
                     </div>""", unsafe_allow_html=True)
             with mc4:
                 st.markdown(f"""<div style="background:#0d1117;border:1px solid #1e3040;border-left:3px solid #ffd600;
                     border-radius:3px;padding:10px 14px;">
                     <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;letter-spacing:2px;color:#7fa8c8;">STRIKE BIAS COUNT</div>
-                    <div style="font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:700;color:#ffd600;">
-                        🟢{bull_count} 🔴{bear_count} ⚪{neut_count}</div>
+                    <div style="font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:700;color:#ffd600;margin-top:3px;">
+                        🟢 {bull_count} &nbsp; 🔴 {bear_count} &nbsp; ⚪ {neut_count}</div>
                     </div>""", unsafe_allow_html=True)
             with mc5:
                 st.markdown(f"""<div style="background:#0d1117;border:1px solid {ob_color};border-left:3px solid {ob_color};
                     border-radius:3px;padding:10px 14px;">
                     <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;letter-spacing:2px;color:#7fa8c8;">OVERALL BIAS</div>
-                    <div style="font-family:'Barlow Condensed',sans-serif;font-size:16px;font-weight:700;color:{ob_color};">{overall_bias}</div>
+                    <div style="font-family:'Barlow Condensed',sans-serif;font-size:16px;font-weight:700;color:{ob_color};margin-top:3px;">{overall_bias}</div>
                     </div>""", unsafe_allow_html=True)
 
-            st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+            # ── OI split bar ──────────────────────────────────────────────────
+            ce_pct_split = total_ce_oi / max(total_ce_oi + total_pe_oi, 1) * 100
+            pe_pct_split = 100 - ce_pct_split
+            st.markdown(f"""
+            <div style="margin:10px 0 4px 0;font-family:'Barlow Condensed',sans-serif;
+                        font-size:9px;letter-spacing:1.5px;color:#3a6080;">
+              TOTAL OI SPLIT — CE {ce_pct_split:.1f}% &nbsp;|&nbsp; PE {pe_pct_split:.1f}%
+            </div>
+            <div style="display:flex;height:8px;border-radius:4px;overflow:hidden;margin-bottom:12px;">
+              <div style="width:{ce_pct_split:.1f}%;background:#ff3d57;"></div>
+              <div style="width:{pe_pct_split:.1f}%;background:#00e676;"></div>
+            </div>""", unsafe_allow_html=True)
+
+            # ── Strike-wise table ────────────────────────────────────────────
             st.dataframe(
                 df_cmp,
                 use_container_width=True,
-                height=min(35 * len(df_cmp) + 38, 520),
+                height=min(35 * len(df_cmp) + 38, 550),
                 column_config={
-                    "Strike":   st.column_config.TextColumn("Strike",   width=100),
+                    "Strike":   st.column_config.TextColumn("Strike",   width=95),
                     "CE OI":    st.column_config.TextColumn("CE OI",    width=80),
                     "CE OI Δ":  st.column_config.TextColumn("CE OI Δ", width=85),
+                    "CE %":     st.column_config.TextColumn("CE %",     width=55),
+                    "PE %":     st.column_config.TextColumn("PE %",     width=55),
                     "PE OI Δ":  st.column_config.TextColumn("PE OI Δ", width=85),
                     "PE OI":    st.column_config.TextColumn("PE OI",    width=80),
-                    "Money":    st.column_config.TextColumn("Money",    width=60),
+                    "Money":    st.column_config.TextColumn("Money",    width=55),
                     "Net Bias": st.column_config.TextColumn("Net Bias", width=100),
                 }
             )
