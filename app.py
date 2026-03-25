@@ -31,6 +31,7 @@ import tab8_stocks
 import tab9_chart
 import tab10_history
 import tab11_basket
+import tab12_paper_trading
 
 st.set_page_config(
     page_title="QuantDesk Pro | Options Terminal",
@@ -364,7 +365,7 @@ def render_header():
 # ======================
 render_header()
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12 = st.tabs([
     "OPTION CHAIN",
     "SMART MONEY",
     "POSITIONS",
@@ -376,6 +377,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
     "\U0001f4ca CHART",
     "\U0001f4f8 HISTORY",
     "\U0001f9fa BASKET",
+    "\U0001f3ae PAPER_Trade",
 ])
 
 with tab1:  tab1_option_chain.render()
@@ -389,3 +391,4 @@ with tab8:  tab8_stocks.render()
 with tab9:  tab9_chart.render()
 with tab10: tab10_history.render()
 with tab11: tab11_basket.render()
+with tab12: tab12_paper_trading.render()
