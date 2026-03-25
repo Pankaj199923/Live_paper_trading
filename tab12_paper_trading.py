@@ -76,6 +76,10 @@ def _init_pt_state():
         st.session_state.pt_pending_ai = {}         # trade_id → True while generating
     if "pt_reset_confirm" not in st.session_state:
         st.session_state.pt_reset_confirm = False
+    if "pt_suggest_result" not in st.session_state:
+        st.session_state.pt_suggest_result = None   # last AI suggestion dict
+    if "pt_suggest_loading" not in st.session_state:
+        st.session_state.pt_suggest_loading = False
 
 
 # ─────────────────────────────────────────────────────────────
@@ -363,6 +367,362 @@ Be direct, professional, and specific. Mention actual price levels. No fluff."""
         return resp.content[0].text.strip()
     except Exception as e:
         return f"⚠️ AI reasoning unavailable: {e}"
+
+
+# ─────────────────────────────────────────────────────────────
+# TRADE SUGGEST ENGINE  ← AI-powered full data analysis
+# ─────────────────────────────────────────────────────────────
+def _build_suggest_prompt(
+    oc_df, spot: float, index_key: str, expiry: str,
+    tech_sum: dict, signal_scores: dict,
+    perf: dict, closed_trades: list, open_trades: list,
+) -> str:
+    """Build a comprehensive prompt feeding ALL available data to Claude."""
+    atm = get_atm_strike(spot, index_key)
+    index_name = INDEX_SHORT.get(index_key, index_key.split("|")[-1])
+
+    # ── Option chain snapshot (ATM ±5 strikes) ──
+    strikes_all = sorted(oc_df["Strike"].unique().tolist())
+    atm_pos = strikes_all.index(atm) if atm in strikes_all else len(strikes_all) // 2
+    nearby = strikes_all[max(0, atm_pos - 5): atm_pos + 6]
+    oc_rows = []
+    for s in nearby:
+        r = oc_df[oc_df["Strike"] == s]
+        if r.empty:
+            continue
+        ce_ltp = r.get("CE_LTP", r.iloc[:, 0]).values[0] if "CE_LTP" in r.columns else "—"
+        pe_ltp = r.get("PE_LTP", r.iloc[:, 0]).values[0] if "PE_LTP" in r.columns else "—"
+        ce_oi  = r.get("CE_OI",  r.iloc[:, 0]).values[0] if "CE_OI"  in r.columns else "—"
+        pe_oi  = r.get("PE_OI",  r.iloc[:, 0]).values[0] if "PE_OI"  in r.columns else "—"
+        ce_iv  = r.get("CE_IV",  r.iloc[:, 0]).values[0] if "CE_IV"  in r.columns else "—"
+        pe_iv  = r.get("PE_IV",  r.iloc[:, 0]).values[0] if "PE_IV"  in r.columns else "—"
+        marker = " ← ATM" if s == atm else ""
+        oc_rows.append(
+            f"  {int(s):>6}{marker:<8}  CE LTP={ce_ltp}  CE OI={ce_oi}  CE IV={ce_iv}  "
+            f"|  PE LTP={pe_ltp}  PE OI={pe_oi}  PE IV={pe_iv}"
+        )
+    oc_snapshot = "\n".join(oc_rows) if oc_rows else "  (option chain data unavailable)"
+
+    # ── Historical trade summary ──
+    hist_lines = []
+    for t in (closed_trades or [])[-20:]:          # last 20 closed trades
+        pnl_tag = f"+₹{t['pnl']:,.0f}" if t.get("pnl", 0) >= 0 else f"-₹{abs(t.get('pnl',0)):,.0f}"
+        hist_lines.append(
+            f"  [{t.get('date','')} {t.get('timestamp','')}] "
+            f"{t.get('action','')} {t.get('opt_type','')} {int(t.get('strike',0))} "
+            f"@ ₹{t.get('entry_price',0)} → {pnl_tag} "
+            f"({t.get('exit_reason','OPEN')})  "
+            f"RSI={t.get('rsi',0):.0f}  PCR={t.get('pcr',1):.3f}  "
+            f"Bull={t.get('signal_bull',0)}/20  Bear={t.get('signal_bear',0)}/20"
+        )
+    hist_block = "\n".join(hist_lines) if hist_lines else "  No closed trade history yet."
+
+    # ── Open positions ──
+    open_lines = []
+    for t in (open_trades or []):
+        open_lines.append(
+            f"  {t.get('action','')} {t.get('opt_type','')} {int(t.get('strike',0))} "
+            f"@ ₹{t.get('entry_price',0)}  LTP=₹{t.get('ltp',0)}  "
+            f"PnL=₹{t.get('pnl',0):+,.0f}  SL=₹{t.get('sl_price',0)}  Tgt=₹{t.get('target_price',0)}"
+        )
+    open_block = "\n".join(open_lines) if open_lines else "  No open positions."
+
+    # ── Performance stats ──
+    if perf:
+        perf_block = (
+            f"  Total trades  : {perf.get('total_trades',0)}\n"
+            f"  Win rate      : {perf.get('win_rate',0):.1f}%  ({perf.get('wins',0)}W / {perf.get('losses',0)}L)\n"
+            f"  Avg win       : ₹{perf.get('avg_win',0):,.0f}   Avg loss: ₹{perf.get('avg_loss',0):,.0f}\n"
+            f"  Expectancy    : ₹{perf.get('expectancy',0):+,.0f} per trade\n"
+            f"  Profit factor : {perf.get('profit_factor',0):.2f}\n"
+            f"  Total P&L     : ₹{perf.get('total_pnl',0):+,.0f}\n"
+            f"  Return        : {perf.get('return_pct',0):+.2f}%\n"
+            f"  Max drawdown  : {perf.get('max_drawdown',0):.1f}%"
+        )
+    else:
+        perf_block = "  No closed trade history — no performance stats available yet."
+
+    acct = st.session_state.pt_account
+
+    return f"""You are QuantDesk Pro's elite AI trading strategist. Analyse ALL the data below and generate a precise, actionable trade suggestion for the CURRENT market conditions.
+
+════════════════════════════════════════
+ACCOUNT STATUS
+════════════════════════════════════════
+Capital      : ₹{acct['capital']:,.0f}
+Available    : ₹{acct['available']:,.0f}
+Peak         : ₹{acct['peak']:,.0f}
+Total trades : {acct['total_trades']}
+Wins / Losses: {acct['wins']} / {acct['losses']}
+
+════════════════════════════════════════
+LIVE MARKET  —  {index_name}
+════════════════════════════════════════
+Spot price   : ₹{spot:,.2f}
+ATM strike   : {int(atm)}
+Expiry       : {expiry}
+
+OPTION CHAIN (ATM ±5 strikes):
+  Strike          CE side                          PE side
+{oc_snapshot}
+
+════════════════════════════════════════
+SIGNAL SCORES
+════════════════════════════════════════
+Market flow  : {signal_scores.get('flow','—')}
+Bull score   : {signal_scores.get('bull',0)}/20
+Bear score   : {signal_scores.get('bear',0)}/20
+PCR          : {signal_scores.get('pcr',1.0):.3f}
+
+════════════════════════════════════════
+TECHNICALS  (5-min candles)
+════════════════════════════════════════
+RSI(14)      : {tech_sum.get('rsi14', 'N/A')}
+EMA trend    : {tech_sum.get('ema_trend', 'N/A')}
+MACD cross   : {tech_sum.get('macd_cross', 'N/A')}
+Price vs VWAP: {tech_sum.get('price_vs_vwap', 'N/A')}
+ATR(14)      : {tech_sum.get('atr14', 'N/A')} pts
+BB condition : {tech_sum.get('bb_condition', 'N/A')}
+SuperTrend   : {tech_sum.get('supertrend_bias', 'N/A')}
+Day High     : ₹{tech_sum.get('high_of_day', 'N/A')}
+Day Low      : ₹{tech_sum.get('low_of_day', 'N/A')}
+VWAP         : ₹{tech_sum.get('vwap', 'N/A')}
+Candles seen : {tech_sum.get('candles_count', 0)}
+
+════════════════════════════════════════
+OPEN POSITIONS
+════════════════════════════════════════
+{open_block}
+
+════════════════════════════════════════
+PERFORMANCE METRICS  (closed trades)
+════════════════════════════════════════
+{perf_block}
+
+════════════════════════════════════════
+TRADE HISTORY  (last 20 closed trades)
+════════════════════════════════════════
+{hist_block}
+
+════════════════════════════════════════
+YOUR TASK
+════════════════════════════════════════
+Using ALL the above data — live signals, option chain, technicals, historical win/loss patterns, and current account state — provide ONE best trade suggestion RIGHT NOW.
+
+Respond in this EXACT format (use rich markdown):
+
+## 🎯 TRADE SUGGESTION
+
+**Instrument:** [Index name] [Strike] [CE/PE]
+**Action:** [BUY / SELL]
+**Entry Zone:** ₹[X] – ₹[Y]
+**Stop Loss:** ₹[X]  ([N] pts from entry)
+**Target:** ₹[X]  ([N] pts from entry)
+**Lots:** [N]  (based on account size and 2% risk rule)
+**R:R Ratio:** 1:[X]
+**Confidence:** [High / Medium / Low]
+
+---
+
+## 📊 MARKET CONTEXT
+3–4 sentences explaining what the market is doing RIGHT NOW and why this is the right moment.
+
+## 🔍 WHY THIS TRADE
+5–7 bullet points, each citing a specific data point from the analysis above. Reference exact numbers (RSI value, PCR level, OI at strike, signal scores, etc.).
+
+## 📈 ENTRY STRATEGY
+Precise entry guidance — where to enter, what confirmation to wait for, what invalidates the setup before entry.
+
+## ⚠️ RISK NOTES
+- Any open position conflicts or portfolio concentration risk
+- What would make this trade wrong
+- Account drawdown context
+
+## 📋 PATTERN INSIGHTS  (from your trade history)
+Based on the trader's closed trade history above, identify 2–3 specific patterns — e.g. "Your BUY CE trades at RSI>65 have an 80% loss rate — current RSI is [X], so this CE buy has elevated risk." Be data-specific.
+
+## 🚦 FINAL VERDICT
+One paragraph. Go or No-Go, and why.
+
+Be direct. Be specific. Use actual numbers. No generic advice."""
+
+
+def _generate_trade_suggestion(
+    oc_df, spot: float, index_key: str, expiry: str,
+    tech_sum: dict, signal_scores: dict,
+) -> dict:
+    """Call Claude to generate a trade suggestion. Returns dict with text + metadata."""
+    try:
+        import anthropic as _ant
+        client = _ant.Anthropic()
+
+        perf         = _calc_performance()
+        closed_trades = st.session_state.pt_closed_trades
+        open_trades   = st.session_state.pt_open_trades
+
+        prompt = _build_suggest_prompt(
+            oc_df, spot, index_key, expiry,
+            tech_sum, signal_scores,
+            perf, closed_trades, open_trades,
+        )
+
+        resp = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1800,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = resp.content[0].text.strip()
+
+        # Extract key fields for display badge
+        action     = "BUY"  if "**Action:** BUY"  in text else "SELL" if "**Action:** SELL" in text else "—"
+        confidence = "High" if "High"  in text[:600] else "Medium" if "Medium" in text[:600] else "Low"
+
+        return {
+            "text":       text,
+            "action":     action,
+            "confidence": confidence,
+            "generated":  now_ist_dt.strftime("%H:%M:%S"),
+            "spot":       spot,
+            "index":      INDEX_SHORT.get(index_key, index_key.split("|")[-1]),
+        }
+    except Exception as e:
+        return {
+            "text":       f"⚠️ Trade suggestion unavailable: {e}",
+            "action":     "—",
+            "confidence": "—",
+            "generated":  now_ist_dt.strftime("%H:%M:%S"),
+            "spot":       spot,
+            "index":      INDEX_SHORT.get(index_key, index_key.split("|")[-1]),
+        }
+
+
+def _render_trade_suggest_section(
+    oc_df, spot: float, index_key: str, expiry: str,
+    tech_sum: dict, signal_scores: dict,
+):
+    """Render the full Trade Suggest panel inside the main render() function."""
+    st.markdown("---")
+
+    # ── Section header ─────────────────────────────────────────────────
+    st.markdown("""
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:4px;">
+      <div style="font-family:'Barlow Condensed',sans-serif;font-size:20px;
+                  font-weight:800;letter-spacing:3px;color:#e8f4ff;">
+        🤖 AI <span style="color:#c084fc;">TRADE SUGGEST</span>
+      </div>
+      <div style="font-family:'Barlow Condensed',sans-serif;font-size:10px;
+                  letter-spacing:1.5px;color:#3a6080;border:1px solid #2a3a4a;
+                  padding:2px 8px;border-radius:2px;">BETA · EDUCATIONAL ONLY</div>
+    </div>
+    <div style="font-family:'Barlow',sans-serif;font-size:12px;color:#3a6080;margin-bottom:12px;">
+      Analyses live option chain · technicals · your full trade history · account state → one actionable suggestion
+    </div>""", unsafe_allow_html=True)
+
+    # ── Data freshness bar ─────────────────────────────────────────────
+    perf = _calc_performance()
+    closed_n  = len(st.session_state.pt_closed_trades)
+    open_n    = len(st.session_state.pt_open_trades)
+    bull_s    = signal_scores.get("bull", 0)
+    bear_s    = signal_scores.get("bear", 0)
+    pcr_v     = signal_scores.get("pcr", 1.0)
+    flow      = signal_scores.get("flow", "Range")
+    rsi_val   = tech_sum.get("rsi14", 50)
+    flow_c    = {"Bullish":"#00e676","Bearish":"#ff3d57","Range":"#ffd600","Choppy":"#7fa8c8"}.get(flow,"#7fa8c8")
+
+    st.markdown(f"""
+    <div style="background:#070b0f;border:1px solid #1a2a3a;border-radius:3px;
+                padding:10px 14px;margin-bottom:12px;
+                display:flex;flex-wrap:wrap;gap:14px;align-items:center;
+                font-family:'Barlow Condensed',sans-serif;font-size:11px;letter-spacing:1px;">
+      <span style="color:#3a6080;">FEEDING INTO AI:</span>
+      <span style="color:#00d4ff;">📊 {closed_n} closed trades</span>
+      <span style="color:#ffd600;">📂 {open_n} open positions</span>
+      <span style="color:{flow_c};">● {flow.upper()}</span>
+      <span style="color:#00e676;">▲ BULL {bull_s}/20</span>
+      <span style="color:#ff3d57;">▼ BEAR {bear_s}/20</span>
+      <span style="color:#c084fc;">PCR {pcr_v:.3f}</span>
+      <span style="color:#7fa8c8;">RSI {rsi_val:.0f}</span>
+      <span style="color:#3a6080;">SPOT ₹{spot:,.0f}</span>
+      {'<span style="color:#00e676;">✓ PERF STATS INCLUDED</span>' if perf else '<span style="color:#3a6080;">⚠ NO HISTORY YET</span>'}
+    </div>""", unsafe_allow_html=True)
+
+    # ── Generate button + last result display ──────────────────────────
+    btn_col, info_col = st.columns([1, 2])
+
+    with btn_col:
+        if st.button(
+            "🤖 Generate Trade Suggestion",
+            use_container_width=True,
+            type="primary",
+            key="pt_suggest_btn",
+        ):
+            with st.spinner("🧠 Claude is analysing your full trading data…"):
+                result = _generate_trade_suggestion(
+                    oc_df, spot, index_key, expiry, tech_sum, signal_scores
+                )
+                st.session_state.pt_suggest_result = result
+            st.rerun()
+
+        if st.session_state.pt_suggest_result:
+            if st.button("🗑️ Clear Suggestion", use_container_width=True, key="pt_suggest_clear"):
+                st.session_state.pt_suggest_result = None
+                st.rerun()
+
+    with info_col:
+        res = st.session_state.pt_suggest_result
+        if res:
+            action_c    = "#00e676" if res["action"] == "BUY" else "#ff3d57" if res["action"] == "SELL" else "#7fa8c8"
+            conf_c      = "#00e676" if res["confidence"] == "High" else "#ffd600" if res["confidence"] == "Medium" else "#ff3d57"
+            st.markdown(f"""
+            <div style="background:#0d1117;border:1px solid #2a3a4a;border-radius:3px;
+                        padding:8px 14px;font-family:'JetBrains Mono',monospace;font-size:11px;">
+              <span style="color:#3a6080;">Last generated:</span>
+              <span style="color:#e8f4ff;margin-left:8px;">{res['generated']}</span>
+              <span style="margin-left:16px;background:#0d1820;border:1px solid {action_c};
+                           color:{action_c};padding:2px 10px;border-radius:10px;
+                           font-family:'Barlow Condensed',sans-serif;font-size:12px;
+                           letter-spacing:1px;font-weight:700;">{res['action']}</span>
+              <span style="margin-left:8px;background:#0d0a18;border:1px solid {conf_c};
+                           color:{conf_c};padding:2px 10px;border-radius:10px;
+                           font-family:'Barlow Condensed',sans-serif;font-size:12px;
+                           letter-spacing:1px;">CONF: {res['confidence'].upper()}</span>
+              <span style="margin-left:8px;color:#3a6080;">{res['index']} @ ₹{res['spot']:,.0f}</span>
+            </div>""", unsafe_allow_html=True)
+        else:
+            st.markdown("""
+            <div style="background:#070b0f;border:1px dashed #1e3040;border-radius:3px;
+                        padding:8px 14px;color:#3a6080;
+                        font-family:'Barlow Condensed',sans-serif;font-size:12px;
+                        letter-spacing:1px;">
+              NO SUGGESTION GENERATED YET — CLICK THE BUTTON TO ANALYSE ALL DATA
+            </div>""", unsafe_allow_html=True)
+
+    # ── Display the full AI suggestion ────────────────────────────────
+    res = st.session_state.pt_suggest_result
+    if res and res.get("text"):
+        st.markdown("<div style='margin-top:8px;'></div>", unsafe_allow_html=True)
+
+        # Wrap the AI output in a styled container
+        st.markdown("""
+        <div style="background:#0a0f1a;border:1px solid #2a3a5a;border-left:3px solid #c084fc;
+                    border-radius:3px;padding:18px 20px;margin-top:4px;">
+          <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;
+                      letter-spacing:2px;color:#c084fc;margin-bottom:10px;">
+            AI TRADE SUGGESTION — EDUCATIONAL USE ONLY · NOT FINANCIAL ADVICE
+          </div>""", unsafe_allow_html=True)
+
+        st.markdown(res["text"])
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        # ── One-click execute from suggestion ─────────────────────────
+        st.markdown("<div style='margin-top:10px;'></div>", unsafe_allow_html=True)
+        st.info(
+            "💡 Review the suggestion carefully. Use the **Order Entry** panel on the left "
+            "to place the trade manually with your own SL/Target/Lots. "
+            "This is a simulation — no real money at risk.",
+            icon="ℹ️",
+        )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -948,6 +1308,13 @@ def render():
                         reasoning = _generate_ai_reasoning(t, oc_df, tech_sum, spot)
                         t["ai_reasoning"] = reasoning
                     st.rerun()
+
+    # ══════════════════════════════════════════════════════
+    # TRADE SUGGEST ENGINE
+    # ══════════════════════════════════════════════════════
+    _render_trade_suggest_section(
+        oc_df, spot, sel_idx, expiry, tech_sum, signal_scores
+    )
 
     # ══════════════════════════════════════════════════════
     # BOTTOM: FULL ANALYTICS DASHBOARD
