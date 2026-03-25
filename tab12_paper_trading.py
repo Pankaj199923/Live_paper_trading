@@ -49,6 +49,57 @@ BROKERAGE_PER_LOT = 40              # flat ₹40/lot round-trip simulation
 STT_RATE          = 0.000625         # STT on sell side for options
 
 # ─────────────────────────────────────────────────────────────
+# ANTHROPIC CLIENT  (singleton — resolves key from all sources)
+# ─────────────────────────────────────────────────────────────
+import os as _os
+import anthropic as _ant
+
+def _get_anthropic_client() -> _ant.Anthropic:
+    """
+    Return a cached Anthropic client, resolving the API key in this order:
+      1. st.secrets["ANTHROPIC_API_KEY"]   ← Streamlit Cloud / secrets.toml
+      2. st.secrets["anthropic"]["api_key"] ← nested secrets.toml style
+      3. os.environ["ANTHROPIC_API_KEY"]    ← local .env / system env
+      4. config module's ANTHROPIC_API_KEY  ← if your config.py exports it
+    Raises RuntimeError with a clear message if none found.
+    """
+    if "pt_anthropic_client" in st.session_state:
+        return st.session_state.pt_anthropic_client
+
+    api_key = None
+
+    # 1 & 2 — Streamlit secrets
+    try:
+        api_key = st.secrets.get("ANTHROPIC_API_KEY") or st.secrets.get("anthropic", {}).get("api_key")
+    except Exception:
+        pass
+
+    # 3 — environment variable
+    if not api_key:
+        api_key = _os.environ.get("ANTHROPIC_API_KEY")
+
+    # 4 — config module
+    if not api_key:
+        try:
+            import config as _cfg
+            api_key = getattr(_cfg, "ANTHROPIC_API_KEY", None)
+        except Exception:
+            pass
+
+    if not api_key:
+        raise RuntimeError(
+            "Anthropic API key not found. Add it to:\n"
+            "  • .streamlit/secrets.toml  →  ANTHROPIC_API_KEY = 'sk-ant-...'\n"
+            "  • OR set env var           →  export ANTHROPIC_API_KEY='sk-ant-...'\n"
+            "  • OR add to config.py      →  ANTHROPIC_API_KEY = 'sk-ant-...'"
+        )
+
+    client = _ant.Anthropic(api_key=api_key)
+    st.session_state.pt_anthropic_client = client   # cache for session lifetime
+    return client
+
+
+# ─────────────────────────────────────────────────────────────
 # STATE INIT HELPERS
 # ─────────────────────────────────────────────────────────────
 def _init_pt_state():
@@ -287,8 +338,7 @@ def _update_live_pnl(oc_df):
 def _generate_ai_reasoning(trade: dict, oc_df, tech_summary: dict, spot: float) -> str:
     """Generate a rich, structured AI reasoning note for a trade."""
     try:
-        import anthropic as _ant
-        client = _ant.Anthropic()
+        client = _get_anthropic_client()
 
         atm = get_atm_strike(spot, trade["index_key"])
         strike_distance = trade["strike"] - atm
@@ -553,8 +603,7 @@ def _generate_trade_suggestion(
 ) -> dict:
     """Call Claude to generate a trade suggestion. Returns dict with text + metadata."""
     try:
-        import anthropic as _ant
-        client = _ant.Anthropic()
+        client = _get_anthropic_client()
 
         perf         = _calc_performance()
         closed_trades = st.session_state.pt_closed_trades
