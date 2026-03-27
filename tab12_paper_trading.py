@@ -151,7 +151,7 @@ def _estimate_margin(action: str, premium: float, strike: float, lots: int, lot_
     else:
         # SELL margin ≈ 10–15 % of notional + premium received
         notional = strike * lots * lot_size
-        return round(notional * 0.12 + premium * lots * lot_size, 0)
+        return round(notional * 0.10 + premium * lots * lot_size, 0)
 
 
 # ─────────────────────────────────────────────────────────────
