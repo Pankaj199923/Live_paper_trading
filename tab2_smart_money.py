@@ -22,98 +22,132 @@ from chart_utils import (compute_technicals, compute_order_flow, detect_liquidit
 
 # ======================================================
 # CUSTOM POPUP SYSTEM — slides LEFT → RIGHT at top of screen
+# Everything in st.markdown so it runs in the MAIN document,
+# not inside a sandboxed iframe.
 # ======================================================
 
 def _inject_popup_css():
-    """Inject the popup container + keyframe CSS once per render."""
+    """
+    Inject global CSS keyframes + rail div into the main Streamlit document.
+    Called once at the top of render().
+    """
     st.markdown("""
     <style>
-    #smart-popup-rail {
-        position: fixed;
-        top: 12px;
-        left: 0;
-        right: 0;
-        z-index: 999999;
-        pointer-events: none;
-        display: flex;
-        flex-direction: column;
-        align-items: flex-start;
-        gap: 6px;
-        padding-left: 12px;
+    /* ── rail that holds all popups ───────────────────── */
+    #sp-rail {
+        position: fixed !important;
+        top: 16px !important;
+        left: 0 !important;
+        width: 100vw !important;
+        z-index: 2147483647 !important;
+        pointer-events: none !important;
+        display: flex !important;
+        flex-direction: column !important;
+        align-items: flex-start !important;
+        gap: 8px !important;
+        padding-left: 16px !important;
     }
-    .smart-popup {
-        pointer-events: auto;
-        display: flex;
-        align-items: center;
-        gap: 10px;
-        padding: 9px 18px 9px 13px;
-        border-radius: 4px;
-        border-left: 4px solid;
-        font-family: 'Barlow Condensed', 'JetBrains Mono', monospace;
-        font-size: 13px;
-        font-weight: 700;
-        letter-spacing: 1.2px;
-        white-space: nowrap;
-        box-shadow: 0 4px 24px rgba(0,0,0,0.55);
-        backdrop-filter: blur(6px);
-        animation: popupSlide 0.38s cubic-bezier(.22,.68,0,1.2) forwards,
-                   popupFade  4.5s ease-in 0.4s forwards;
+    /* ── individual popup pill ─────────────────────────── */
+    .sp-box {
+        pointer-events: auto !important;
+        display: inline-flex !important;
+        align-items: center !important;
+        gap: 10px !important;
+        padding: 10px 20px 10px 14px !important;
+        border-radius: 5px !important;
+        border-left: 5px solid !important;
+        font-family: 'Barlow Condensed', 'JetBrains Mono', monospace !important;
+        font-size: 14px !important;
+        font-weight: 700 !important;
+        letter-spacing: 1.3px !important;
+        white-space: nowrap !important;
+        box-shadow: 0 6px 28px rgba(0,0,0,0.7) !important;
+        /* slide in from left, then fade out */
+        animation: sp-slide 0.4s cubic-bezier(.22,.68,0,1.15) forwards,
+                   sp-fade  5s linear 0.5s forwards !important;
     }
-    @keyframes popupSlide {
-        0%   { opacity: 0; transform: translateX(-120%); }
-        100% { opacity: 1; transform: translateX(0);     }
+    @keyframes sp-slide {
+        0%   { opacity:0; transform:translateX(-110%); }
+        100% { opacity:1; transform:translateX(0);     }
     }
-    @keyframes popupFade {
-        0%   { opacity: 1; }
-        75%  { opacity: 1; }
-        100% { opacity: 0; pointer-events: none; }
+    @keyframes sp-fade {
+        0%,70% { opacity:1; }
+        100%   { opacity:0; }
     }
-    .smart-popup.danger  { background: rgba(25,5,5,0.92);  border-color: #ff1744; color: #ff6b6b; }
-    .smart-popup.success { background: rgba(3,18,10,0.92); border-color: #00e676; color: #69f0ae; }
-    .smart-popup.warning { background: rgba(22,14,2,0.92); border-color: #ff8c00; color: #ffb74d; }
-    .smart-popup.info    { background: rgba(2,12,22,0.92); border-color: #00d4ff; color: #80deea; }
-    .smart-popup .pop-icon { font-size: 16px; line-height: 1; }
-    .smart-popup .pop-msg  { font-size: 13px; }
+    /* colour variants */
+    .sp-danger  { background:rgba(28,4,4,0.95)  !important; border-color:#ff1744 !important; color:#ff6b6b !important; }
+    .sp-success { background:rgba(3,20,10,0.95) !important; border-color:#00e676 !important; color:#69f0ae !important; }
+    .sp-warning { background:rgba(24,13,2,0.95) !important; border-color:#ff8c00 !important; color:#ffb74d !important; }
+    .sp-info    { background:rgba(2,13,24,0.95) !important; border-color:#00d4ff !important; color:#80deea !important; }
+    .sp-icon { font-size:17px !important; line-height:1 !important; }
+    .sp-msg  { font-size:14px !important; }
     </style>
-    <div id="smart-popup-rail"></div>
+
+    <div id="sp-rail"></div>
+
+    <script>
+    /* ensure rail is always in <body>, not buried in Streamlit shadow DOM */
+    (function ensureRail() {
+        var r = document.getElementById('sp-rail');
+        if (r && r.parentNode !== document.body) {
+            document.body.appendChild(r);
+        }
+        if (!r) {
+            r = document.createElement('div');
+            r.id = 'sp-rail';
+            document.body.appendChild(r);
+        }
+    })();
+    </script>
     """, unsafe_allow_html=True)
 
 
-def _show_popup(message: str, kind: str = "danger", icon: str = "🚨", duration_ms: int = 5000):
+def _show_popup(message: str, kind: str = "danger", icon: str = "🚨", duration_ms: int = 5500):
     """
-    Fire a popup that slides LEFT → RIGHT at the TOP of the screen.
+    Fires a popup that slides LEFT → RIGHT at the very TOP of the screen.
+    Uses st.markdown (main document) — NOT st.components.v1.html (iframe).
     kind: 'danger' | 'success' | 'warning' | 'info'
     """
     import html as _html
-    safe_msg  = _html.escape(str(message))
-    safe_icon = icon
-    js = f"""
+    safe_msg = _html.escape(str(message))
+    # Unique id so the auto-remove timeout targets only this popup
+    uid = f"sp_{abs(hash(message + kind))}"
+    st.markdown(f"""
     <script>
     (function() {{
-        var rail = document.getElementById('smart-popup-rail');
+        /* get or recreate the rail directly on <body> */
+        var rail = document.getElementById('sp-rail');
         if (!rail) {{
             rail = document.createElement('div');
-            rail.id = 'smart-popup-rail';
+            rail.id = 'sp-rail';
             Object.assign(rail.style, {{
-                position:'fixed', top:'12px', left:'0', right:'0',
-                zIndex:'999999', pointerEvents:'none',
-                display:'flex', flexDirection:'column',
-                alignItems:'flex-start', gap:'6px', paddingLeft:'12px'
+                position:'fixed', top:'16px', left:'0',
+                width:'100vw', zIndex:'2147483647',
+                pointerEvents:'none', display:'flex',
+                flexDirection:'column', alignItems:'flex-start',
+                gap:'8px', paddingLeft:'16px'
             }});
             document.body.appendChild(rail);
+        }} else if (rail.parentNode !== document.body) {{
+            document.body.appendChild(rail);
         }}
+
+        /* build the popup pill */
         var p = document.createElement('div');
-        p.className = 'smart-popup {kind}';
-        p.innerHTML = '<span class="pop-icon">{safe_icon}</span>'
-                    + '<span class="pop-msg">{safe_msg}</span>';
+        p.id = '{uid}';
+        p.className = 'sp-box sp-{kind}';
+        p.innerHTML = '<span class="sp-icon">{icon}</span>'
+                    + '<span class="sp-msg">{safe_msg}</span>';
         rail.insertBefore(p, rail.firstChild);
+
+        /* auto-remove after animation completes */
         setTimeout(function() {{
-            if (p.parentNode) p.parentNode.removeChild(p);
+            var el = document.getElementById('{uid}');
+            if (el && el.parentNode) el.parentNode.removeChild(el);
         }}, {duration_ms});
     }})();
     </script>
-    """
-    st.components.v1.html(js, height=0, scrolling=False)
+    """, unsafe_allow_html=True)
 
 
 # ======================================================
