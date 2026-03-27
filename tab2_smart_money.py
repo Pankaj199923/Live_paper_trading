@@ -403,6 +403,320 @@ def render():
         st.warning(f"CE vs PE OI comparison error: {e}")
 
     # ======================================================
+    # OI SPIKE CHANGE DETECTOR + STRIKE CONTINUE
+    # ======================================================
+    st.markdown("---")
+    section_header("🔥 OI Spike Change Detector", "Strikes with sudden large OI build-up or unwinding — smart money footprint")
+    try:
+        oc_ois = oc2.copy()
+        if all(c in oc_ois.columns for c in ["CE_OI_Change", "PE_OI_Change", "CE_OI", "PE_OI"]):
+
+            # ── Thresholds ─────────────────────────────────────────────────────
+            ce_oi_mean = oc_ois["CE_OI_Change"].abs().mean()
+            pe_oi_mean = oc_ois["PE_OI_Change"].abs().mean()
+            oi_spike_mult = 2.5  # 2.5× avg OI change = spike
+
+            ce_oi_spikes = oc_ois[oc_ois["CE_OI_Change"].abs() >= ce_oi_mean * oi_spike_mult].copy()
+            pe_oi_spikes = oc_ois[oc_ois["PE_OI_Change"].abs() >= pe_oi_mean * oi_spike_mult].copy()
+
+            atm_ois = get_atm_strike(spot2, sel_idx2)
+
+            # ── Fire POPUP toasts for large OI spikes ──────────────────────────
+            for _, r in ce_oi_spikes.iterrows():
+                mult_oi = abs(float(r["CE_OI_Change"])) / max(ce_oi_mean, 1)
+                direction = "📈 BUILD-UP" if float(r["CE_OI_Change"]) > 0 else "📉 UNWIND"
+                if mult_oi >= 3.0:
+                    st.toast(f"🚨 CE OI SPIKE {int(r['Strike'])} — {direction} ({mult_oi:.1f}× avg)", icon="🔴")
+                    if "alert_log" in st.session_state:
+                        st.session_state.alert_log.append({
+                            "time": datetime.now(IST).strftime("%H:%M:%S"),
+                            "msg": f"CE OI Spike {int(r['Strike'])} {direction} ({mult_oi:.1f}×)",
+                            "type": "DANGER"
+                        })
+            for _, r in pe_oi_spikes.iterrows():
+                mult_oi = abs(float(r["PE_OI_Change"])) / max(pe_oi_mean, 1)
+                direction = "📈 BUILD-UP" if float(r["PE_OI_Change"]) > 0 else "📉 UNWIND"
+                if mult_oi >= 3.0:
+                    st.toast(f"🚨 PE OI SPIKE {int(r['Strike'])} — {direction} ({mult_oi:.1f}× avg)", icon="🟢")
+                    if "alert_log" in st.session_state:
+                        st.session_state.alert_log.append({
+                            "time": datetime.now(IST).strftime("%H:%M:%S"),
+                            "msg": f"PE OI Spike {int(r['Strike'])} {direction} ({mult_oi:.1f}×)",
+                            "type": "INFO"
+                        })
+
+            # ── STRIKE CONTINUE detection ──────────────────────────────────────
+            # "Strike Continue" = consecutive strikes where OI is building in same direction
+            def _detect_strike_continue(df_sorted, col_chg, threshold_mult, mean_chg):
+                """Find runs of consecutive strikes with OI building in same direction."""
+                runs = []
+                current_run = []
+                prev_dir = None
+                for _, row_sc in df_sorted.iterrows():
+                    chg = float(row_sc[col_chg])
+                    if abs(chg) < mean_chg * 0.5:  # too small, treat as neutral
+                        if len(current_run) >= 2:
+                            runs.append(current_run[:])
+                        current_run = []
+                        prev_dir = None
+                        continue
+                    direction = "UP" if chg > 0 else "DOWN"
+                    if direction == prev_dir:
+                        current_run.append({"strike": int(row_sc["Strike"]), "chg": chg, "dir": direction})
+                    else:
+                        if len(current_run) >= 2:
+                            runs.append(current_run[:])
+                        current_run = [{"strike": int(row_sc["Strike"]), "chg": chg, "dir": direction}]
+                        prev_dir = direction
+                if len(current_run) >= 2:
+                    runs.append(current_run)
+                return runs
+
+            oc_ois_sorted = oc_ois.sort_values("Strike")
+            ce_runs = _detect_strike_continue(oc_ois_sorted, "CE_OI_Change", oi_spike_mult, ce_oi_mean)
+            pe_runs = _detect_strike_continue(oc_ois_sorted, "PE_OI_Change", oi_spike_mult, pe_oi_mean)
+
+            # Fire toast for strong continues (3+ strikes)
+            for run in ce_runs:
+                if len(run) >= 3:
+                    strikes_str = "→".join([str(r["strike"]) for r in run])
+                    direction_lbl = "BUILD-UP 📈" if run[0]["dir"] == "UP" else "UNWIND 📉"
+                    st.toast(f"⚡ CE CONTINUE {direction_lbl}: {strikes_str}", icon="🔴")
+                    if "alert_log" in st.session_state:
+                        st.session_state.alert_log.append({
+                            "time": datetime.now(IST).strftime("%H:%M:%S"),
+                            "msg": f"CE Continue {direction_lbl} {run[0]['strike']}→{run[-1]['strike']}",
+                            "type": "DANGER"
+                        })
+            for run in pe_runs:
+                if len(run) >= 3:
+                    strikes_str = "→".join([str(r["strike"]) for r in run])
+                    direction_lbl = "BUILD-UP 📈" if run[0]["dir"] == "UP" else "UNWIND 📉"
+                    st.toast(f"⚡ PE CONTINUE {direction_lbl}: {strikes_str}", icon="🟢")
+                    if "alert_log" in st.session_state:
+                        st.session_state.alert_log.append({
+                            "time": datetime.now(IST).strftime("%H:%M:%S"),
+                            "msg": f"PE Continue {direction_lbl} {run[0]['strike']}→{run[-1]['strike']}",
+                            "type": "INFO"
+                        })
+
+            # ── Summary cards ─────────────────────────────────────────────────
+            oi_sc1, oi_sc2, oi_sc3, oi_sc4 = st.columns(4)
+            with oi_sc1:
+                total_ce_spike = len(ce_oi_spikes)
+                st.markdown(f"""<div style="background:#0d1117;border:1px solid #1e3040;border-left:3px solid #ff3d57;
+                    border-radius:3px;padding:10px 14px;">
+                    <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;letter-spacing:2px;color:#7fa8c8;">CE OI SPIKES</div>
+                    <div style="font-family:'JetBrains Mono',monospace;font-size:24px;font-weight:700;color:#ff3d57;">{total_ce_spike}</div>
+                    <div style="font-size:10px;color:#3a6080;">≥{oi_spike_mult:.0f}× avg OI change</div>
+                    </div>""", unsafe_allow_html=True)
+            with oi_sc2:
+                total_pe_spike = len(pe_oi_spikes)
+                st.markdown(f"""<div style="background:#0d1117;border:1px solid #1e3040;border-left:3px solid #00e676;
+                    border-radius:3px;padding:10px 14px;">
+                    <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;letter-spacing:2px;color:#7fa8c8;">PE OI SPIKES</div>
+                    <div style="font-family:'JetBrains Mono',monospace;font-size:24px;font-weight:700;color:#00e676;">{total_pe_spike}</div>
+                    <div style="font-size:10px;color:#3a6080;">≥{oi_spike_mult:.0f}× avg OI change</div>
+                    </div>""", unsafe_allow_html=True)
+            with oi_sc3:
+                ce_continues = len([r for r in ce_runs if len(r) >= 2])
+                best_ce_run  = max((len(r) for r in ce_runs), default=0)
+                st.markdown(f"""<div style="background:#0d1117;border:1px solid #1e3040;border-left:3px solid #ff8c00;
+                    border-radius:3px;padding:10px 14px;">
+                    <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;letter-spacing:2px;color:#7fa8c8;">CE CONTINUE RUNS</div>
+                    <div style="font-family:'JetBrains Mono',monospace;font-size:24px;font-weight:700;color:#ff8c00;">{ce_continues}</div>
+                    <div style="font-size:10px;color:#3a6080;">Longest: {best_ce_run} strikes</div>
+                    </div>""", unsafe_allow_html=True)
+            with oi_sc4:
+                pe_continues = len([r for r in pe_runs if len(r) >= 2])
+                best_pe_run  = max((len(r) for r in pe_runs), default=0)
+                st.markdown(f"""<div style="background:#0d1117;border:1px solid #1e3040;border-left:3px solid #00d4ff;
+                    border-radius:3px;padding:10px 14px;">
+                    <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;letter-spacing:2px;color:#7fa8c8;">PE CONTINUE RUNS</div>
+                    <div style="font-family:'JetBrains Mono',monospace;font-size:24px;font-weight:700;color:#00d4ff;">{pe_continues}</div>
+                    <div style="font-size:10px;color:#3a6080;">Longest: {best_pe_run} strikes</div>
+                    </div>""", unsafe_allow_html=True)
+
+            st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+
+            # ── Strike Continue table ──────────────────────────────────────────
+            if ce_runs or pe_runs:
+                sc_tab1, sc_tab2 = st.tabs(["📊 CE Strike Continue", "📊 PE Strike Continue"])
+
+                with sc_tab1:
+                    if ce_runs:
+                        ce_run_rows = []
+                        for run in sorted(ce_runs, key=lambda x: -len(x)):
+                            direction_icon = "📈 BUILD-UP" if run[0]["dir"] == "UP" else "📉 UNWIND"
+                            strike_range   = f"{run[0]['strike']} → {run[-1]['strike']}"
+                            total_chg      = sum(r["chg"] for r in run)
+                            strength       = "🔥 STRONG" if len(run) >= 3 else "⚡ MODERATE"
+                            ce_run_rows.append({
+                                "CE Strikes": strike_range,
+                                "Count": len(run),
+                                "Direction": direction_icon,
+                                "Total OI Δ": f"{total_chg/1e3:+.1f}K",
+                                "Strength": strength,
+                                "Meaning": "Resistance building" if run[0]["dir"] == "UP" else "CE Unwinding (Bullish)",
+                            })
+                        st.dataframe(pd.DataFrame(ce_run_rows), use_container_width=True,
+                                     height=min(35 * len(ce_run_rows) + 38, 320))
+                    else:
+                        st.info("No CE strike continue patterns detected.")
+
+                with sc_tab2:
+                    if pe_runs:
+                        pe_run_rows = []
+                        for run in sorted(pe_runs, key=lambda x: -len(x)):
+                            direction_icon = "📈 BUILD-UP" if run[0]["dir"] == "UP" else "📉 UNWIND"
+                            strike_range   = f"{run[0]['strike']} → {run[-1]['strike']}"
+                            total_chg      = sum(r["chg"] for r in run)
+                            strength       = "🔥 STRONG" if len(run) >= 3 else "⚡ MODERATE"
+                            pe_run_rows.append({
+                                "PE Strikes": strike_range,
+                                "Count": len(run),
+                                "Direction": direction_icon,
+                                "Total OI Δ": f"{total_chg/1e3:+.1f}K",
+                                "Strength": strength,
+                                "Meaning": "Support building" if run[0]["dir"] == "UP" else "PE Unwinding (Bearish)",
+                            })
+                        st.dataframe(pd.DataFrame(pe_run_rows), use_container_width=True,
+                                     height=min(35 * len(pe_run_rows) + 38, 320))
+                    else:
+                        st.info("No PE strike continue patterns detected.")
+
+            # ── OI Spike Change Table with ▲▼ arrows ──────────────────────────
+            st.markdown("<div style='margin-top:16px'></div>", unsafe_allow_html=True)
+            st.markdown("""<div style="font-family:'Barlow Condensed',sans-serif;font-size:12px;
+            letter-spacing:2px;color:#ff8c00;margin-bottom:8px;">⚡ OI SPIKE STRIKES — INCREASE ▲ &amp; DECREASE ▼</div>""",
+            unsafe_allow_html=True)
+
+            oi_spike_rows = []
+            all_spike_strikes = set(ce_oi_spikes["Strike"].tolist()) | set(pe_oi_spikes["Strike"].tolist())
+            for strike_val in sorted(all_spike_strikes):
+                row_s = oc_ois[oc_ois["Strike"] == strike_val]
+                if row_s.empty:
+                    continue
+                row_s = row_s.iloc[0]
+                ce_chg_s = float(row_s["CE_OI_Change"])
+                pe_chg_s = float(row_s["PE_OI_Change"])
+                ce_mult_s = abs(ce_chg_s) / max(ce_oi_mean, 1)
+                pe_mult_s = abs(pe_chg_s) / max(pe_oi_mean, 1)
+                atm_tag = " ★ATM" if strike_val == atm_ois else ""
+                money = "ATM" if strike_val == atm_ois else ("ITM" if strike_val < spot2 else "OTM")
+
+                # OI direction arrow icons
+                ce_arrow = "▲ INC" if ce_chg_s > 0 else ("▼ DEC" if ce_chg_s < 0 else "— FLAT")
+                pe_arrow = "▲ INC" if pe_chg_s > 0 else ("▼ DEC" if pe_chg_s < 0 else "— FLAT")
+                is_ce_spike = strike_val in ce_oi_spikes["Strike"].values
+                is_pe_spike = strike_val in pe_oi_spikes["Strike"].values
+
+                oi_spike_rows.append({
+                    "Strike":     f"{int(strike_val):,}{atm_tag}",
+                    "Money":      money,
+                    "CE OI Δ":    f"{ce_chg_s/1e3:+.1f}K",
+                    "CE Dir":     f"{'🔴' if ce_chg_s > 0 else '🟢'} {ce_arrow}",
+                    "CE Spike":   f"🚨 {ce_mult_s:.1f}×" if is_ce_spike else "—",
+                    "PE OI Δ":    f"{pe_chg_s/1e3:+.1f}K",
+                    "PE Dir":     f"{'🟢' if pe_chg_s > 0 else '🔴'} {pe_arrow}",
+                    "PE Spike":   f"🚨 {pe_mult_s:.1f}×" if is_pe_spike else "—",
+                    "Signal":     "🔴 BEARISH" if (is_ce_spike and ce_chg_s > 0 and ce_chg_s > pe_chg_s)
+                                  else "🟢 BULLISH" if (is_pe_spike and pe_chg_s > 0 and pe_chg_s > ce_chg_s)
+                                  else "⚪ WATCH",
+                })
+
+            if oi_spike_rows:
+                df_oi_spk = pd.DataFrame(oi_spike_rows)
+                st.dataframe(
+                    df_oi_spk,
+                    use_container_width=True,
+                    height=min(35 * len(df_oi_spk) + 38, 420),
+                    column_config={
+                        "Strike":   st.column_config.TextColumn("Strike",   width=110),
+                        "Money":    st.column_config.TextColumn("Money",    width=55),
+                        "CE OI Δ":  st.column_config.TextColumn("CE OI Δ", width=85),
+                        "CE Dir":   st.column_config.TextColumn("CE Dir",   width=95),
+                        "CE Spike": st.column_config.TextColumn("CE Spike", width=80),
+                        "PE OI Δ":  st.column_config.TextColumn("PE OI Δ", width=85),
+                        "PE Dir":   st.column_config.TextColumn("PE Dir",   width=95),
+                        "PE Spike": st.column_config.TextColumn("PE Spike", width=80),
+                        "Signal":   st.column_config.TextColumn("Signal",   width=100),
+                    }
+                )
+
+            # ── OI Change chart with spike markers ────────────────────────────
+            oi_spk_fig = go.Figure()
+            oc_ois_ch = oc_ois.sort_values("Strike")
+            ce_bar_colors = [
+                "#ff1744" if abs(v) >= ce_oi_mean * oi_spike_mult else
+                "#ff3d57" if v > 0 else "#ff8a80"
+                for v in oc_ois_ch["CE_OI_Change"]
+            ]
+            pe_bar_colors = [
+                "#00c853" if abs(v) >= pe_oi_mean * oi_spike_mult else
+                "#00e676" if v > 0 else "#69f0ae"
+                for v in oc_ois_ch["PE_OI_Change"]
+            ]
+            oi_spk_fig.add_bar(
+                x=oc_ois_ch["Strike"], y=oc_ois_ch["CE_OI_Change"] / 1e3,
+                name="CE OI Δ", marker_color=ce_bar_colors, opacity=0.9,
+                text=[f"{v/1e3:+.1f}K" for v in oc_ois_ch["CE_OI_Change"]],
+                textposition="outside", textfont=dict(size=8, color="#ff3d57"),
+            )
+            oi_spk_fig.add_bar(
+                x=oc_ois_ch["Strike"], y=oc_ois_ch["PE_OI_Change"] / 1e3,
+                name="PE OI Δ", marker_color=pe_bar_colors, opacity=0.9,
+                text=[f"{v/1e3:+.1f}K" for v in oc_ois_ch["PE_OI_Change"]],
+                textposition="outside", textfont=dict(size=8, color="#00e676"),
+            )
+            # Spike threshold lines
+            oi_spk_fig.add_hline(y=ce_oi_mean * oi_spike_mult / 1e3,
+                                  line_color="#ff8c00", line_dash="dash", line_width=1.2,
+                                  annotation_text=f"CE Spike {oi_spike_mult:.0f}× threshold",
+                                  annotation_font_color="#ff8c00", annotation_font_size=9)
+            oi_spk_fig.add_hline(y=-ce_oi_mean * oi_spike_mult / 1e3,
+                                  line_color="#ff8c00", line_dash="dash", line_width=1.2)
+            oi_spk_fig.add_hline(y=pe_oi_mean * oi_spike_mult / 1e3,
+                                  line_color="#00d4ff", line_dash="dash", line_width=1.2,
+                                  annotation_text=f"PE Spike {oi_spike_mult:.0f}× threshold",
+                                  annotation_font_color="#00d4ff", annotation_font_size=9)
+            oi_spk_fig.add_hline(y=-pe_oi_mean * oi_spike_mult / 1e3,
+                                  line_color="#00d4ff", line_dash="dash", line_width=1.2)
+            oi_spk_fig.add_hline(y=0, line_color="#3a6080", line_width=0.8)
+            oi_spk_fig.add_vline(x=float(atm_ois), line_color="#00d4ff", line_dash="dot", line_width=1.5,
+                                  annotation_text="ATM", annotation_font_color="#00d4ff", annotation_font_size=10)
+            # Mark spike strikes with scatter annotations
+            for _, r in ce_oi_spikes.iterrows():
+                oi_spk_fig.add_annotation(
+                    x=float(r["Strike"]), y=float(r["CE_OI_Change"]) / 1e3,
+                    text="🚨", showarrow=True, arrowhead=2,
+                    arrowcolor="#ff1744", font=dict(size=13),
+                    ay=-20 if float(r["CE_OI_Change"]) > 0 else 20
+                )
+            for _, r in pe_oi_spikes.iterrows():
+                oi_spk_fig.add_annotation(
+                    x=float(r["Strike"]), y=float(r["PE_OI_Change"]) / 1e3,
+                    text="🚨", showarrow=True, arrowhead=2,
+                    arrowcolor="#00c853", font=dict(size=13),
+                    ay=-20 if float(r["PE_OI_Change"]) > 0 else 20
+                )
+            oi_spk_fig.update_layout(
+                barmode="group", height=340,
+                paper_bgcolor="#070b0f", plot_bgcolor="#070b0f",
+                font=dict(family="JetBrains Mono", color="#7fa8c8", size=11),
+                margin=dict(l=40, r=20, t=20, b=40),
+                xaxis=dict(gridcolor="#1e3040", tickangle=-45, tickformat="d", title="Strike"),
+                yaxis=dict(gridcolor="#1e3040", title="OI Change (000s)"),
+                legend=dict(bgcolor="rgba(0,0,0,0)", font_color="#7fa8c8"),
+            )
+            st.plotly_chart(oi_spk_fig, use_container_width=True, key="oi_spike_chart")
+
+        else:
+            st.info("CE_OI_Change and PE_OI_Change columns required for OI spike detection.")
+    except Exception as e:
+        st.warning(f"OI spike detector error: {e}")
+
+    # ======================================================
     # VOLUME SPIKE ALERTS
     # ======================================================
     st.markdown("---")
