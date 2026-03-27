@@ -21,9 +21,108 @@ from chart_utils import (compute_technicals, compute_order_flow, detect_liquidit
                          detect_order_blocks, detect_fvg, detect_bos_choch, get_order_flow_summary)
 
 # ======================================================
+# CUSTOM POPUP SYSTEM — slides LEFT → RIGHT at top of screen
+# ======================================================
+
+def _inject_popup_css():
+    """Inject the popup container + keyframe CSS once per render."""
+    st.markdown("""
+    <style>
+    #smart-popup-rail {
+        position: fixed;
+        top: 12px;
+        left: 0;
+        right: 0;
+        z-index: 999999;
+        pointer-events: none;
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 6px;
+        padding-left: 12px;
+    }
+    .smart-popup {
+        pointer-events: auto;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 9px 18px 9px 13px;
+        border-radius: 4px;
+        border-left: 4px solid;
+        font-family: 'Barlow Condensed', 'JetBrains Mono', monospace;
+        font-size: 13px;
+        font-weight: 700;
+        letter-spacing: 1.2px;
+        white-space: nowrap;
+        box-shadow: 0 4px 24px rgba(0,0,0,0.55);
+        backdrop-filter: blur(6px);
+        animation: popupSlide 0.38s cubic-bezier(.22,.68,0,1.2) forwards,
+                   popupFade  4.5s ease-in 0.4s forwards;
+    }
+    @keyframes popupSlide {
+        0%   { opacity: 0; transform: translateX(-120%); }
+        100% { opacity: 1; transform: translateX(0);     }
+    }
+    @keyframes popupFade {
+        0%   { opacity: 1; }
+        75%  { opacity: 1; }
+        100% { opacity: 0; pointer-events: none; }
+    }
+    .smart-popup.danger  { background: rgba(25,5,5,0.92);  border-color: #ff1744; color: #ff6b6b; }
+    .smart-popup.success { background: rgba(3,18,10,0.92); border-color: #00e676; color: #69f0ae; }
+    .smart-popup.warning { background: rgba(22,14,2,0.92); border-color: #ff8c00; color: #ffb74d; }
+    .smart-popup.info    { background: rgba(2,12,22,0.92); border-color: #00d4ff; color: #80deea; }
+    .smart-popup .pop-icon { font-size: 16px; line-height: 1; }
+    .smart-popup .pop-msg  { font-size: 13px; }
+    </style>
+    <div id="smart-popup-rail"></div>
+    """, unsafe_allow_html=True)
+
+
+def _show_popup(message: str, kind: str = "danger", icon: str = "🚨", duration_ms: int = 5000):
+    """
+    Fire a popup that slides LEFT → RIGHT at the TOP of the screen.
+    kind: 'danger' | 'success' | 'warning' | 'info'
+    """
+    import html as _html
+    safe_msg  = _html.escape(str(message))
+    safe_icon = icon
+    js = f"""
+    <script>
+    (function() {{
+        var rail = document.getElementById('smart-popup-rail');
+        if (!rail) {{
+            rail = document.createElement('div');
+            rail.id = 'smart-popup-rail';
+            Object.assign(rail.style, {{
+                position:'fixed', top:'12px', left:'0', right:'0',
+                zIndex:'999999', pointerEvents:'none',
+                display:'flex', flexDirection:'column',
+                alignItems:'flex-start', gap:'6px', paddingLeft:'12px'
+            }});
+            document.body.appendChild(rail);
+        }}
+        var p = document.createElement('div');
+        p.className = 'smart-popup {kind}';
+        p.innerHTML = '<span class="pop-icon">{safe_icon}</span>'
+                    + '<span class="pop-msg">{safe_msg}</span>';
+        rail.insertBefore(p, rail.firstChild);
+        setTimeout(function() {{
+            if (p.parentNode) p.parentNode.removeChild(p);
+        }}, {duration_ms});
+    }})();
+    </script>
+    """
+    st.components.v1.html(js, height=0, scrolling=False)
+
+
+# ======================================================
 # TAB 2 — SMART MONEY + GEX
 # ======================================================
 def render():
+    # Inject sliding popup CSS + rail once per render
+    _inject_popup_css()
+
     section_header("Smart Money Flow + GEX Analysis", "Institutional positioning, Gamma Exposure, Call/Put Walls")
 
     oc2     = st.session_state.get("current_option_chain", pd.DataFrame())
@@ -60,11 +159,11 @@ def render():
     # GEX flip
     prev_gex = st.session_state.get("prev_net_gex", 0)
     if prev_gex > 0 and total_net_gex < 0:
-        st.toast("⚡ GEX FLIP → TRENDING MODE", icon="🔴")
+        _show_popup("⚡ GEX FLIP → TRENDING MODE", kind="danger", icon="🔴")
         st.session_state.alert_log.append({"time": datetime.now(IST).strftime("%H:%M:%S"),
                                            "msg": "GEX Flip → Trending", "type": "DANGER"})
     elif prev_gex < 0 and total_net_gex > 0:
-        st.toast("⚡ GEX FLIP → MEAN REVERSION MODE", icon="🟢")
+        _show_popup("⚡ GEX FLIP → MEAN REVERSION MODE", kind="success", icon="🟢")
         st.session_state.alert_log.append({"time": datetime.now(IST).strftime("%H:%M:%S"),
                                            "msg": "GEX Flip → Mean Rev", "type": "INFO"})
     st.session_state.prev_net_gex = total_net_gex
@@ -426,7 +525,7 @@ def render():
                 mult_oi = abs(float(r["CE_OI_Change"])) / max(ce_oi_mean, 1)
                 direction = "📈 BUILD-UP" if float(r["CE_OI_Change"]) > 0 else "📉 UNWIND"
                 if mult_oi >= 3.0:
-                    st.toast(f"🚨 CE OI SPIKE {int(r['Strike'])} — {direction} ({mult_oi:.1f}× avg)", icon="🔴")
+                    _show_popup(f"🚨 CE OI SPIKE {int(r['Strike'])} — {direction} ({mult_oi:.1f}× avg)", kind="danger", icon="🔴")
                     if "alert_log" in st.session_state:
                         st.session_state.alert_log.append({
                             "time": datetime.now(IST).strftime("%H:%M:%S"),
@@ -437,7 +536,7 @@ def render():
                 mult_oi = abs(float(r["PE_OI_Change"])) / max(pe_oi_mean, 1)
                 direction = "📈 BUILD-UP" if float(r["PE_OI_Change"]) > 0 else "📉 UNWIND"
                 if mult_oi >= 3.0:
-                    st.toast(f"🚨 PE OI SPIKE {int(r['Strike'])} — {direction} ({mult_oi:.1f}× avg)", icon="🟢")
+                    _show_popup(f"🚨 PE OI SPIKE {int(r['Strike'])} — {direction} ({mult_oi:.1f}× avg)", kind="success", icon="🟢")
                     if "alert_log" in st.session_state:
                         st.session_state.alert_log.append({
                             "time": datetime.now(IST).strftime("%H:%M:%S"),
@@ -481,7 +580,7 @@ def render():
                 if len(run) >= 3:
                     strikes_str = "→".join([str(r["strike"]) for r in run])
                     direction_lbl = "BUILD-UP 📈" if run[0]["dir"] == "UP" else "UNWIND 📉"
-                    st.toast(f"⚡ CE CONTINUE {direction_lbl}: {strikes_str}", icon="🔴")
+                    _show_popup(f"⚡ CE CONTINUE {direction_lbl}: {strikes_str}", kind="danger", icon="🔴")
                     if "alert_log" in st.session_state:
                         st.session_state.alert_log.append({
                             "time": datetime.now(IST).strftime("%H:%M:%S"),
@@ -492,7 +591,7 @@ def render():
                 if len(run) >= 3:
                     strikes_str = "→".join([str(r["strike"]) for r in run])
                     direction_lbl = "BUILD-UP 📈" if run[0]["dir"] == "UP" else "UNWIND 📉"
-                    st.toast(f"⚡ PE CONTINUE {direction_lbl}: {strikes_str}", icon="🟢")
+                    _show_popup(f"⚡ PE CONTINUE {direction_lbl}: {strikes_str}", kind="success", icon="🟢")
                     if "alert_log" in st.session_state:
                         st.session_state.alert_log.append({
                             "time": datetime.now(IST).strftime("%H:%M:%S"),
@@ -776,7 +875,7 @@ def render():
                 # Fire toast for very high spikes (>3×)
                 high_spikes = [a for a in spike_alerts if float(a["vs Avg"].replace("×","")) >= 3.0]
                 for hs in high_spikes[:3]:
-                    st.toast(f"🚨 Vol Spike {hs['Type']} {hs['Strike']} — {hs['vs Avg']} avg", icon="🔔")
+                    _show_popup(f"🚨 Vol Spike {hs['Type']} {hs['Strike']} — {hs['vs Avg']} avg", kind="warning", icon="🔔")
                     if "alert_log" in st.session_state:
                         st.session_state.alert_log.append({
                             "time": datetime.now(IST).strftime("%H:%M:%S"),
