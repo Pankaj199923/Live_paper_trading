@@ -113,7 +113,7 @@ def render():
 
     # ── Manual Leg Builder ───────────────────────────────────────────────
     section_header("Add Leg Manually")
-    la, lb, lc, ld, le, lf = st.columns([1,1,2,1,1,1])
+    la, lb, lc, ld = st.columns([1, 1, 2, 1])
     with la: leg_action = st.selectbox("Action", ["SELL","BUY"], key="bl_action")
     with lb: leg_type   = st.selectbox("Type",   ["CE","PE"],    key="bl_type")
     with lc:
@@ -122,12 +122,83 @@ def render():
                                     index=strike_opts.index(atm_b) if atm_b in strike_opts else 0,
                                     key="bl_strike")
     with ld: leg_lots = st.number_input("Lots", value=1, min_value=1, max_value=50, key="bl_lots")
-    with le:
-        col_ltp = f"{leg_type}_LTP"
-        row_s   = oc_b[oc_b["Strike"] == leg_strike]
-        auto_prem = round(float(row_s[col_ltp].values[0]), 2) if not row_s.empty and col_ltp in row_s.columns else 0.0
-        leg_prem  = st.number_input("Premium ₹", value=auto_prem, min_value=0.0, step=0.5, key="bl_prem")
-    with lf:
+
+    # ── Auto-capture live premium for selected strike + type ──────────────
+    col_ltp   = f"{leg_type}_LTP"
+    row_s     = oc_b[oc_b["Strike"] == leg_strike]
+    auto_prem = round(float(row_s[col_ltp].values[0]), 2) if not row_s.empty and col_ltp in row_s.columns else 0.0
+
+    # Dynamic key — resets widget value whenever strike OR type changes
+    prem_widget_key = f"bl_prem_{int(leg_strike)}_{leg_type}"
+
+    # Show live LTP preview bar
+    prev_prem_key = f"bl_prev_prem_{leg_type}"
+    prev_prem     = st.session_state.get(prev_prem_key, auto_prem)
+    prem_delta    = auto_prem - prev_prem
+    prem_delta_c  = "#00e676" if prem_delta >= 0 else "#ff3d57"
+    st.session_state[prev_prem_key] = auto_prem
+
+    ce_iv = round(float(row_s["CE_IV"].values[0]), 2) if not row_s.empty and "CE_IV" in row_s.columns else 0
+    pe_iv = round(float(row_s["PE_IV"].values[0]), 2) if not row_s.empty and "PE_IV" in row_s.columns else 0
+    ce_oi = int(row_s["CE_OI"].values[0]) if not row_s.empty and "CE_OI" in row_s.columns else 0
+    pe_oi = int(row_s["PE_OI"].values[0]) if not row_s.empty and "PE_OI" in row_s.columns else 0
+    ce_ltp= round(float(row_s["CE_LTP"].values[0]), 2) if not row_s.empty and "CE_LTP" in row_s.columns else 0
+    pe_ltp= round(float(row_s["PE_LTP"].values[0]), 2) if not row_s.empty and "PE_LTP" in row_s.columns else 0
+    atm_tag = "🟡 ATM" if leg_strike == atm_b else ("🔵 ITM" if (leg_type=="CE" and leg_strike < atm_b) or (leg_type=="PE" and leg_strike > atm_b) else "⚪ OTM")
+
+    st.markdown(f"""
+    <div style="background:#0d1117;border:1px solid #1e3040;border-left:3px solid #ff8c00;
+                border-radius:3px;padding:10px 16px;margin:8px 0 6px 0;
+                display:flex;flex-wrap:wrap;gap:20px;align-items:center;">
+      <div>
+        <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;
+                    letter-spacing:1.5px;color:#7fa8c8;">STRIKE</div>
+        <div style="font-family:'JetBrains Mono',monospace;font-size:20px;
+                    font-weight:700;color:#ff8c00;">{int(leg_strike):,}</div>
+        <div style="font-size:10px;color:#3a6080;">{atm_tag}</div>
+      </div>
+      <div style="border-left:1px solid #1e3040;padding-left:20px;">
+        <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;
+                    letter-spacing:1px;color:#7fa8c8;">CE LTP</div>
+        <div style="font-family:'JetBrains Mono',monospace;font-size:18px;
+                    font-weight:700;color:#ff3d57;">₹{ce_ltp}</div>
+        <div style="font-size:10px;color:#3a6080;">IV: {ce_iv}% | OI: {ce_oi/1e5:.1f}L</div>
+      </div>
+      <div style="border-left:1px solid #1e3040;padding-left:20px;">
+        <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;
+                    letter-spacing:1px;color:#7fa8c8;">PE LTP</div>
+        <div style="font-family:'JetBrains Mono',monospace;font-size:18px;
+                    font-weight:700;color:#00e676;">₹{pe_ltp}</div>
+        <div style="font-size:10px;color:#3a6080;">IV: {pe_iv}% | OI: {pe_oi/1e5:.1f}L</div>
+      </div>
+      <div style="border-left:1px solid #1e3040;padding-left:20px;">
+        <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;
+                    letter-spacing:1px;color:#7fa8c8;">SELECTED ({leg_type}) AUTO LTP</div>
+        <div style="font-family:'JetBrains Mono',monospace;font-size:22px;
+                    font-weight:700;color:{'#ff3d57' if leg_type=='CE' else '#00e676'};">
+          ₹{auto_prem}</div>
+        <div style="font-size:10px;color:{prem_delta_c};">
+          {'+' if prem_delta >= 0 else ''}{prem_delta:.2f} change</div>
+      </div>
+      <div style="margin-left:auto;background:#0a1520;border:1px solid #1e3040;
+                  border-radius:3px;padding:6px 12px;text-align:center;">
+        <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;
+                    letter-spacing:1px;color:#3a6080;">STRADDLE VALUE</div>
+        <div style="font-family:'JetBrains Mono',monospace;font-size:16px;
+                    font-weight:700;color:#ffd600;">₹{round(ce_ltp+pe_ltp,2)}</div>
+        <div style="font-size:10px;color:#3a6080;">CE+PE combined</div>
+      </div>
+    </div>""", unsafe_allow_html=True)
+
+    pe2, pf2 = st.columns([2, 1])
+    with pe2:
+        # Use dynamic key so value refreshes when strike/type changes
+        leg_prem = st.number_input(
+            f"Premium ₹  ({leg_type} @ {int(leg_strike):,})  — auto-filled from LTP",
+            value=auto_prem, min_value=0.0, step=0.5,
+            key=prem_widget_key
+        )
+    with pf2:
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("➕ ADD LEG", use_container_width=True, type="primary"):
             st.session_state.basket_legs.append({
