@@ -1,10 +1,11 @@
 import os
+import requests as _req
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from config import (ACCESS_TOKEN, IST, now_ist, now_ist_dt, MARKET_OPEN,
                     df_indices, INDEX_SHORT, LOT_SIZES,
                     BASE_DIR, TRADE_FILE, TODAY_TRADES_FILE, CLOSED_POS_FILE,
@@ -20,6 +21,140 @@ from analytics import (bs_price, bs_greeks, implied_vol_newton, calculate_gamma_
                        compute_signal_score, generate_ai_trade, check_alerts, call_claude_trade_setup)
 from chart_utils import (compute_technicals, compute_order_flow, detect_liquidity_sweeps,
                          detect_order_blocks, detect_fvg, detect_bos_choch, get_order_flow_summary)
+
+# ── Nifty 50 + Nifty Next 50 — Market Scanner Universe ──────────────────────
+SCANNER_UNIVERSE = [
+    # Nifty 50
+    "RELIANCE","TCS","HDFCBANK","BHARTIARTL","ICICIBANK","INFOSYS","SBIN","HINDUNILVR",
+    "ITC","LT","BAJFINANCE","HCLTECH","MARUTI","SUNPHARMA","AXISBANK","KOTAKBANK",
+    "TITAN","WIPRO","ONGC","NTPC","POWERGRID","ULTRACEMCO","ASIANPAINT","BAJAJFINSV",
+    "TATAMOTORS","TATASTEEL","JSWSTEEL","NESTLEIND","TECHM","HINDALCO","ADANIENT",
+    "ADANITOTAL","COALINDIA","BPCL","DIVISLAB","DRREDDY","CIPLA","EICHERMOT",
+    "APOLLOHOSP","INDUSINDBK","BRITANNIA","HEROMOTOCO","SHREECEM","HDFCLIFE",
+    "SBILIFE","BAJAJ-AUTO","TATACONSUM","M&M","GRASIM","LTIM",
+    # Nifty Next 50
+    "ADANIPORTS","ADANIGREEN","AMBUJACEM","AUROPHARMA","BANKBARODA","BEL","BERGEPAINT",
+    "BOSCHLTD","CANBK","CHOLAFIN","COLPAL","DALBHARAT","DABUR","DLF","GAIL",
+    "GODREJCP","HAL","HAVELLS","ICICIPRULI","ICICIGI","INDUSTOWER","IRCTC","JINDALSTEL",
+    "LICI","LUPIN","MANKIND","MARICO","MUTHOOTFIN","NAVINFLUOR","OBEROIRLTY",
+    "OFSS","PAYTM","PIDILITIND","PGHH","PIIND","RECLTD","SBICARD","SIEMENS",
+    "TATAPOWER","TORNTPHARM","TRENT","TVSMOTOR","UBL","UNIONBANK","UPL","VEDL",
+    "VOLTAS","WHIRLPOOL","ZOMATO","ZYDUSLIFE",
+    # Extra liquid mid-caps
+    "ABB","ABCAPITAL","ABFRL","ACC","ALKEM","ATUL","BALKRISIND","BANDHANBNK",
+    "BIOCON","CEATLTD","CONCOR","COROMANDEL","CROMPTON","CUB","DELHIVERY",
+    "ESCORTS","FEDERALBNK","GLENMARK","GNFC","GODREJPROP","GRANULES","HDFCAMC",
+    "HONAUT","IDFCFIRSTB","IIFL","INDHOTEL","IOC","JKCEMENT","JUBLFOOD",
+    "KANSAINER","LICHSGFIN","LALPATHLAB","MFSL","MOTHERSON","MPHASIS","MRF",
+    "NAUKRI","NBCC","NCC","NHPC","NMDC","PAGEIND","PEL","PERSISTENT",
+    "PFC","PHOENIXLTD","POLYCAB","RAYMOND","SAIL","STARHEALTH","SUNTV",
+    "SUPREMEIND","TATACHEM","TATACOMM","TORNTPOWER","TRIDENT","TVSL","VBL",
+]
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _batch_fetch_ltps(instrument_keys_str: str) -> dict:
+    """
+    Batch fetch LTPs for all scanner stocks in ONE API call.
+    Returns dict: {instrument_key → last_price}
+    """
+    try:
+        r = _req.get(
+            "https://api.upstox.com/v3/market-quote/ltp",
+            headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
+            params={"instrument_key": instrument_keys_str},
+            timeout=10,
+        )
+        data = r.json().get("data", {})
+        result = {}
+        for raw_key, v in data.items():
+            clean = raw_key.replace("%7C", "|").replace("%7c", "|")
+            price = v.get("last_price", 0)
+            if price > 0:
+                result[clean] = price
+        return result
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_prev_close_batch(instrument_keys_list: tuple) -> dict:
+    """
+    Fetch previous day closing price for all scanner stocks.
+    Returns dict: {instrument_key → prev_close}
+    """
+    result = {}
+    today = date.today()
+    for days_back in range(1, 6):
+        d = today - timedelta(days=days_back)
+        if d.weekday() < 5:
+            from_date = to_date = d.strftime("%Y-%m-%d")
+            break
+
+    for ikey in instrument_keys_list:
+        try:
+            key_enc = ikey.replace("|", "%7C")
+            url = f"https://api.upstox.com/v2/historical-candle/{key_enc}/day/{to_date}/{from_date}"
+            resp = _req.get(url, headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}, timeout=5)
+            candles = resp.json().get("data", {}).get("candles", [])
+            if candles:
+                result[ikey] = float(candles[0][4])
+        except Exception:
+            pass
+    return result
+
+
+def _run_market_scanner():
+    """
+    Scan ALL stocks in SCANNER_UNIVERSE, fetch live LTP + prev close,
+    return sorted DataFrame of movers.
+    """
+    # Build instrument key map from instrument_df
+    if instrument_df.empty:
+        return pd.DataFrame()
+
+    idf = instrument_df[instrument_df["Symbol"].isin(SCANNER_UNIVERSE)].copy()
+    if idf.empty:
+        return pd.DataFrame()
+
+    # Batch fetch LTPs (all in one call)
+    all_keys    = idf["instrument_key"].tolist()
+    keys_str    = ",".join(all_keys)
+    ltp_map     = _batch_fetch_ltps(keys_str)
+
+    # Batch fetch prev close (cached 5 min)
+    # Use session state to avoid re-fetching every refresh
+    cache_key = "scanner_prev_close"
+    if cache_key not in st.session_state or not st.session_state[cache_key]:
+        pc_map = _fetch_prev_close_batch(tuple(all_keys))
+        st.session_state[cache_key] = pc_map
+    else:
+        pc_map = st.session_state[cache_key]
+
+    rows = []
+    for _, row in idf.iterrows():
+        sym   = row["Symbol"]
+        ikey  = row["instrument_key"]
+        ltp   = ltp_map.get(ikey, 0)
+        prev  = pc_map.get(ikey, 0)
+        if ltp <= 0:
+            continue
+        chg_rs  = round(ltp - prev, 2)  if prev > 0 else 0.0
+        chg_pct = round((chg_rs / prev) * 100, 2) if prev > 0 else 0.0
+        rows.append({
+            "Symbol":    sym,
+            "LTP":       round(ltp, 2),
+            "PrevClose": round(prev, 2) if prev > 0 else None,
+            "Chg₹":     chg_rs,
+            "Chg%":      chg_pct,
+            "Abs%":      abs(chg_pct),
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows).sort_values("Abs%", ascending=False).reset_index(drop=True)
+    return df
+
 
 # ======================================================
 # TAB 8 — STOCKS TERMINAL
@@ -260,187 +395,316 @@ def render():
       <span style="color:#3a6080;margin-left:auto;">UPDATED: <b style="color:#ff8c00;">{now8}</b></span>
     </div>""", unsafe_allow_html=True)
 
-    # ── TOP MOVERS (ALL watchlist stocks, ranked by absolute move) ────────
+    # ═══════════════════════════════════════════════════════════════════════
+    # 📡 MARKET-WIDE SCANNER  — Nifty 50 + Next 50 + Top Midcaps (~150 stocks)
+    #     Completely INDEPENDENT of watchlist — no selection needed
+    # ═══════════════════════════════════════════════════════════════════════
     st.markdown("---")
     st.markdown("""
-    <div style="font-family:'Barlow Condensed',sans-serif;font-size:18px;font-weight:800;
-                letter-spacing:3px;color:#e8f4ff;border-left:3px solid #ff8c00;
-                padding:4px 12px;background:linear-gradient(90deg,#111920,transparent);
-                margin-bottom:12px;">
-      📊 TOP <span style="color:#ff8c00;">MOVERS</span>
-      <span style="font-size:11px;color:#3a6080;font-weight:400;letter-spacing:1px;margin-left:8px;">
-        ALL WATCHLIST STOCKS — RANKED BY % CHANGE FROM PREV CLOSE</span>
+    <div style="display:flex;align-items:center;justify-content:space-between;
+                border-bottom:1px solid #1e3040;padding-bottom:8px;margin-bottom:14px;">
+      <div>
+        <div style="font-family:'Barlow Condensed',sans-serif;font-size:22px;font-weight:800;
+                    letter-spacing:3px;color:#e8f4ff;">
+          📡 MARKET <span style="color:#ff8c00;">SCANNER</span></div>
+        <div style="font-family:'Barlow',sans-serif;font-size:12px;color:#7fa8c8;margin-top:2px;">
+          Auto-scans Nifty50 + NiftyNext50 + Top Midcaps (~150 stocks) · No selection needed ·
+          Ranked by % move from prev close</div>
+      </div>
+      <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#3a6080;text-align:right;">
+        REFRESHES EVERY 60s<br>
+        <span style="color:#ff8c00;">{now8}</span>
+      </div>
     </div>""", unsafe_allow_html=True)
 
-    # Filter only rows with valid data (LTP and Prev Close available)
-    df8_valid = df8[df8["LTP"].notna() & df8["Prev Close"].notna()].copy()
-    df8_valid["AbsChg%"] = df8_valid["Chg%"].abs()
+    # ── Manual refresh button + prev close reset ──────────────────────────
+    sc1, sc2, sc3 = st.columns([1, 1, 4])
+    with sc1:
+        if st.button("🔄 Refresh Scanner", key="scanner_refresh", use_container_width=True):
+            st.cache_data.clear()
+            st.session_state.pop("scanner_prev_close", None)
+            st.rerun()
+    with sc2:
+        if st.button("🗑️ Reset Prev Close", key="scanner_pc_reset", use_container_width=True):
+            st.session_state.pop("scanner_prev_close", None)
+            st.rerun()
+    with sc3:
+        st.markdown(f"""<div style="font-family:'Barlow Condensed',sans-serif;font-size:11px;
+            color:#3a6080;padding:6px 0;letter-spacing:1px;">
+            UNIVERSE: {len(SCANNER_UNIVERSE)} stocks &nbsp;|&nbsp;
+            Prev close: {'✅ Loaded' if st.session_state.get('scanner_prev_close') else '⏳ Loading on first run'}
+            &nbsp;|&nbsp; LTP cache: 60s</div>""", unsafe_allow_html=True)
 
-    if df8_valid.empty:
-        st.markdown("""<div style="color:#3a6080;font-family:'Barlow Condensed',sans-serif;
-            font-size:13px;letter-spacing:1px;padding:12px;">
-            No price data available — prices load after first refresh.</div>""",
-            unsafe_allow_html=True)
+    # ── Run scanner ───────────────────────────────────────────────────────
+    with st.spinner("📡 Scanning market... fetching live prices"):
+        scan_df = _run_market_scanner()
+
+    if scan_df.empty:
+        st.markdown("""
+        <div style="background:#0d1117;border:1px dashed #1e3040;padding:24px;
+                    text-align:center;border-radius:4px;color:#3a6080;
+                    font-family:'Barlow Condensed',sans-serif;font-size:14px;letter-spacing:1px;">
+          ⏳ SCANNER DATA LOADING...<br>
+          <span style="font-size:12px;">First load takes ~10s as prev close is fetched.
+          If stuck, click Refresh Scanner.</span>
+        </div>""", unsafe_allow_html=True)
     else:
-        # Sort ALL stocks by absolute % change (biggest movers first)
-        movers_all = df8_valid.sort_values("AbsChg%", ascending=False).reset_index(drop=True)
+        # Separate valid (has prev close) and LTP-only rows
+        scan_with_prev = scan_df[scan_df["PrevClose"].notna() & (scan_df["PrevClose"] > 0)].copy()
+        scan_ltp_only  = scan_df[scan_df["PrevClose"].isna()  | (scan_df["PrevClose"] == 0)].copy()
 
-        # Split into top gainers and top losers
-        gainers8 = movers_all[movers_all["Chg%"] > 0].head(5)
-        losers8  = movers_all[movers_all["Chg%"] < 0].sort_values("Chg%").head(5)
+        total_scan    = len(scan_with_prev)
+        adv_scan      = len(scan_with_prev[scan_with_prev["Chg%"] > 0])
+        dec_scan      = len(scan_with_prev[scan_with_prev["Chg%"] < 0])
+        unch_scan     = total_scan - adv_scan - dec_scan
+        adv_pct_scan  = adv_scan / max(total_scan, 1) * 100
+        dec_pct_scan  = dec_scan / max(total_scan, 1) * 100
+        unch_pct_scan = 100 - adv_pct_scan - dec_pct_scan
+        breadth_sent  = ("🟢 BULLISH" if adv_scan > dec_scan * 1.4
+                         else "🔴 BEARISH" if dec_scan > adv_scan * 1.4
+                         else "🟡 MIXED")
+        breadth_c     = ("#00e676" if "BULL" in breadth_sent
+                         else "#ff3d57" if "BEAR" in breadth_sent
+                         else "#ffd600")
 
-        # ── Market sentiment bar ─────────────────────────────────────────
-        total_valid  = len(df8_valid)
-        adv_pct8     = advancers8 / max(total_valid, 1) * 100
-        dec_pct8     = decliners8 / max(total_valid, 1) * 100
-        unch_pct8    = 100 - adv_pct8 - dec_pct8
-        overall_sent = "🟢 BULLISH" if advancers8 > decliners8 * 1.5 else \
-                       "🔴 BEARISH" if decliners8 > advancers8 * 1.5 else "🟡 MIXED"
-        sent_c       = "#00e676" if "BULL" in overall_sent else "#ff3d57" if "BEAR" in overall_sent else "#ffd600"
+        # ── Summary metrics ───────────────────────────────────────────────
+        best_gainer = scan_with_prev[scan_with_prev["Chg%"] > 0].iloc[0] if adv_scan > 0 else None
+        best_loser  = scan_with_prev[scan_with_prev["Chg%"] < 0].sort_values("Chg%").iloc[0] if dec_scan > 0 else None
 
+        m1, m2, m3, m4, m5 = st.columns(5)
+        with m1:
+            st.markdown(f"""<div style="background:#0d1117;border:1px solid #1e3040;
+                border-top:2px solid #ff8c00;border-radius:3px;padding:10px 14px;">
+                <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;
+                            letter-spacing:1.5px;color:#7fa8c8;">STOCKS SCANNED</div>
+                <div style="font-family:'JetBrains Mono',monospace;font-size:22px;
+                            font-weight:700;color:#ff8c00;">{total_scan}</div>
+                <div style="font-size:10px;color:#3a6080;">of {len(SCANNER_UNIVERSE)} universe</div>
+                </div>""", unsafe_allow_html=True)
+        with m2:
+            st.markdown(f"""<div style="background:#0d1117;border:1px solid #1e3040;
+                border-top:2px solid #00e676;border-radius:3px;padding:10px 14px;">
+                <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;
+                            letter-spacing:1.5px;color:#7fa8c8;">ADVANCERS</div>
+                <div style="font-family:'JetBrains Mono',monospace;font-size:22px;
+                            font-weight:700;color:#00e676;">{adv_scan}</div>
+                <div style="font-size:10px;color:#3a6080;">{adv_pct_scan:.0f}% of scanned</div>
+                </div>""", unsafe_allow_html=True)
+        with m3:
+            st.markdown(f"""<div style="background:#0d1117;border:1px solid #1e3040;
+                border-top:2px solid #ff3d57;border-radius:3px;padding:10px 14px;">
+                <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;
+                            letter-spacing:1.5px;color:#7fa8c8;">DECLINERS</div>
+                <div style="font-family:'JetBrains Mono',monospace;font-size:22px;
+                            font-weight:700;color:#ff3d57;">{dec_scan}</div>
+                <div style="font-size:10px;color:#3a6080;">{dec_pct_scan:.0f}% of scanned</div>
+                </div>""", unsafe_allow_html=True)
+        with m4:
+            if best_gainer is not None:
+                st.markdown(f"""<div style="background:#010e06;border:1px solid #00e676;
+                    border-top:2px solid #00e676;border-radius:3px;padding:10px 14px;">
+                    <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;
+                                letter-spacing:1.5px;color:#7fa8c8;">TOP GAINER</div>
+                    <div style="font-family:'Barlow Condensed',sans-serif;font-size:18px;
+                                font-weight:800;color:#e8f4ff;">{best_gainer['Symbol']}</div>
+                    <div style="font-family:'JetBrains Mono',monospace;font-size:16px;
+                                font-weight:700;color:#00e676;">▲ {best_gainer['Chg%']:.2f}%</div>
+                    <div style="font-size:10px;color:#3a6080;">LTP ₹{best_gainer['LTP']:,.2f}</div>
+                    </div>""", unsafe_allow_html=True)
+        with m5:
+            if best_loser is not None:
+                st.markdown(f"""<div style="background:#120103;border:1px solid #ff3d57;
+                    border-top:2px solid #ff3d57;border-radius:3px;padding:10px 14px;">
+                    <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;
+                                letter-spacing:1.5px;color:#7fa8c8;">TOP LOSER</div>
+                    <div style="font-family:'Barlow Condensed',sans-serif;font-size:18px;
+                                font-weight:800;color:#e8f4ff;">{best_loser['Symbol']}</div>
+                    <div style="font-family:'JetBrains Mono',monospace;font-size:16px;
+                                font-weight:700;color:#ff3d57;">▼ {abs(best_loser['Chg%']):.2f}%</div>
+                    <div style="font-size:10px;color:#3a6080;">LTP ₹{best_loser['LTP']:,.2f}</div>
+                    </div>""", unsafe_allow_html=True)
+
+        # ── Market Breadth Bar ────────────────────────────────────────────
         st.markdown(f"""
         <div style="background:#0d1117;border:1px solid #1e3040;border-radius:3px;
-                    padding:10px 16px;margin-bottom:10px;">
-          <div style="display:flex;justify-content:space-between;
-                      font-family:'Barlow Condensed',sans-serif;font-size:10px;
+                    padding:10px 16px;margin:10px 0;">
+          <div style="display:flex;justify-content:space-between;align-items:center;
+                      font-family:'Barlow Condensed',sans-serif;font-size:11px;
                       letter-spacing:1px;margin-bottom:5px;">
-            <span style="color:#00e676;">▲ ADVANCE {advancers8} ({adv_pct8:.0f}%)</span>
-            <span style="color:{sent_c};font-size:13px;font-weight:700;">
-              BREADTH: {overall_sent}</span>
-            <span style="color:#ff3d57;">▼ DECLINE {decliners8} ({dec_pct8:.0f}%)</span>
+            <span style="color:#00e676;">▲ ADVANCE {adv_scan} ({adv_pct_scan:.0f}%)</span>
+            <span style="color:{breadth_c};font-size:15px;font-weight:700;letter-spacing:2px;">
+              BREADTH: {breadth_sent}</span>
+            <span style="color:#ff3d57;">▼ DECLINE {dec_scan} ({dec_pct_scan:.0f}%)</span>
           </div>
-          <div style="display:flex;height:10px;border-radius:5px;overflow:hidden;">
-            <div style="width:{adv_pct8:.0f}%;background:#00e676;"></div>
-            <div style="width:{unch_pct8:.0f}%;background:#1e3040;"></div>
-            <div style="width:{dec_pct8:.0f}%;background:#ff3d57;"></div>
+          <div style="display:flex;height:12px;border-radius:6px;overflow:hidden;gap:2px;">
+            <div style="width:{adv_pct_scan:.1f}%;background:#00e676;border-radius:4px 0 0 4px;"></div>
+            <div style="width:{unch_pct_scan:.1f}%;background:#1e3040;"></div>
+            <div style="width:{dec_pct_scan:.1f}%;background:#ff3d57;border-radius:0 4px 4px 0;"></div>
+          </div>
+          <div style="display:flex;justify-content:space-between;margin-top:4px;
+                      font-family:'JetBrains Mono',monospace;font-size:10px;color:#3a6080;">
+            <span>Unchanged: {unch_scan}</span>
+            <span>Total scanned with prev close: {total_scan}</span>
           </div>
         </div>""", unsafe_allow_html=True)
 
-        # ── Two-column: Gainers | Losers ─────────────────────────────────
-        gcol, lcol = st.columns(2)
+        # ── Top 10 Gainers + Top 10 Losers — side by side ─────────────────
+        gainers_scan = scan_with_prev[scan_with_prev["Chg%"] > 0].head(10)
+        losers_scan  = scan_with_prev[scan_with_prev["Chg%"] < 0].sort_values("Chg%").head(10)
+        max_abs_move = scan_with_prev["Abs%"].max() if not scan_with_prev.empty else 1.0
 
-        with gcol:
-            st.markdown("""<div style="font-family:'Barlow Condensed',sans-serif;font-size:13px;
-                font-weight:700;letter-spacing:2px;color:#00e676;margin-bottom:6px;">
-                🟢 TOP GAINERS</div>""", unsafe_allow_html=True)
-            if gainers8.empty:
-                st.markdown("<div style='color:#3a6080;font-size:12px;'>No gainers in watchlist</div>",
+        g_col, l_col = st.columns(2)
+
+        # ── TOP GAINERS ────────────────────────────────────────────────
+        with g_col:
+            st.markdown("""<div style="font-family:'Barlow Condensed',sans-serif;font-size:14px;
+                font-weight:700;letter-spacing:2px;color:#00e676;margin-bottom:8px;
+                border-left:3px solid #00e676;padding-left:10px;">
+                🟢 TOP 10 GAINERS — ALL STOCKS</div>""", unsafe_allow_html=True)
+
+            if gainers_scan.empty:
+                st.markdown("<div style='color:#3a6080;font-size:12px;padding:8px;'>No gainers found</div>",
                             unsafe_allow_html=True)
-            for ri, (_, r) in enumerate(gainers8.iterrows()):
-                bar_w = min(abs(r["Chg%"]) / max(movers_all["AbsChg%"].max(), 0.01) * 100, 100)
-                chg_rs = r.get("Chg ₹", 0)
-                st.markdown(f"""
-                <div style="background:#010e06;border:1px solid #1e4025;border-left:3px solid #00e676;
-                            border-radius:3px;padding:10px 14px;margin:5px 0;position:relative;
-                            overflow:hidden;">
-                  <div style="position:absolute;top:0;left:0;width:{bar_w:.0f}%;height:100%;
-                              background:rgba(0,230,118,0.05);z-index:0;"></div>
-                  <div style="position:relative;z-index:1;">
-                    <div style="display:flex;justify-content:space-between;align-items:center;">
-                      <div>
-                        <span style="font-family:'Barlow Condensed',sans-serif;font-size:17px;
-                                     font-weight:800;color:#e8f4ff;letter-spacing:0.5px;">
-                          #{ri+1} &nbsp;{r['Symbol']}</span>
+            else:
+                for rank_g, (_, row_g) in enumerate(gainers_scan.iterrows(), 1):
+                    bar_w_g = min(row_g["Abs%"] / max(max_abs_move, 0.01) * 100, 100)
+                    st.markdown(f"""
+                    <div style="background:#010e06;border:1px solid #1a4025;
+                                border-left:3px solid #00e676;border-radius:3px;
+                                padding:9px 14px;margin:4px 0;position:relative;overflow:hidden;">
+                      <div style="position:absolute;top:0;left:0;width:{bar_w_g:.0f}%;height:100%;
+                                  background:rgba(0,230,118,0.06);pointer-events:none;"></div>
+                      <div style="position:relative;display:flex;justify-content:space-between;
+                                  align-items:center;">
+                        <div>
+                          <span style="font-family:'Barlow Condensed',sans-serif;font-size:11px;
+                                       color:#3a6080;margin-right:8px;">#{rank_g}</span>
+                          <span style="font-family:'Barlow Condensed',sans-serif;font-size:17px;
+                                       font-weight:800;color:#e8f4ff;">{row_g['Symbol']}</span>
+                          <div style="font-family:'JetBrains Mono',monospace;font-size:11px;
+                                      color:#7fa8c8;margin-top:2px;">
+                            LTP ₹{row_g['LTP']:,.2f}
+                            &nbsp;|&nbsp;Prev ₹{row_g['PrevClose']:,.2f}</div>
+                        </div>
+                        <div style="text-align:right;">
+                          <div style="font-family:'JetBrains Mono',monospace;font-size:20px;
+                                      font-weight:700;color:#00e676;">
+                            ▲ {row_g['Chg%']:.2f}%</div>
+                          <div style="font-family:'JetBrains Mono',monospace;font-size:12px;
+                                      color:#00e676;">+₹{row_g['Chg₹']:,.2f}</div>
+                        </div>
                       </div>
-                      <div style="text-align:right;">
-                        <div style="font-family:'JetBrains Mono',monospace;font-size:18px;
-                                    font-weight:700;color:#00e676;">▲ {abs(r['Chg%']):.2f}%</div>
-                        <div style="font-family:'JetBrains Mono',monospace;font-size:11px;
-                                    color:#00e676;">+₹{abs(chg_rs):.2f}</div>
-                      </div>
-                    </div>
-                    <div style="display:flex;gap:16px;margin-top:4px;
-                                font-family:'JetBrains Mono',monospace;font-size:11px;color:#7fa8c8;">
-                      <span>LTP: <b style="color:#e8f4ff;">₹{r['LTP']:,.2f}</b></span>
-                      <span>Prev: ₹{r['Prev Close']:,.2f}</span>
-                    </div>
-                  </div>
-                </div>""", unsafe_allow_html=True)
+                    </div>""", unsafe_allow_html=True)
 
-        with lcol:
-            st.markdown("""<div style="font-family:'Barlow Condensed',sans-serif;font-size:13px;
-                font-weight:700;letter-spacing:2px;color:#ff3d57;margin-bottom:6px;">
-                🔴 TOP LOSERS</div>""", unsafe_allow_html=True)
-            if losers8.empty:
-                st.markdown("<div style='color:#3a6080;font-size:12px;'>No losers in watchlist</div>",
+        # ── TOP LOSERS ─────────────────────────────────────────────────
+        with l_col:
+            st.markdown("""<div style="font-family:'Barlow Condensed',sans-serif;font-size:14px;
+                font-weight:700;letter-spacing:2px;color:#ff3d57;margin-bottom:8px;
+                border-left:3px solid #ff3d57;padding-left:10px;">
+                🔴 TOP 10 LOSERS — ALL STOCKS</div>""", unsafe_allow_html=True)
+
+            if losers_scan.empty:
+                st.markdown("<div style='color:#3a6080;font-size:12px;padding:8px;'>No losers found</div>",
                             unsafe_allow_html=True)
-            for ri, (_, r) in enumerate(losers8.iterrows()):
-                bar_w = min(abs(r["Chg%"]) / max(movers_all["AbsChg%"].max(), 0.01) * 100, 100)
-                chg_rs = r.get("Chg ₹", 0)
-                st.markdown(f"""
-                <div style="background:#120103;border:1px solid #401520;border-left:3px solid #ff3d57;
-                            border-radius:3px;padding:10px 14px;margin:5px 0;position:relative;
-                            overflow:hidden;">
-                  <div style="position:absolute;top:0;left:0;width:{bar_w:.0f}%;height:100%;
-                              background:rgba(255,61,87,0.05);z-index:0;"></div>
-                  <div style="position:relative;z-index:1;">
-                    <div style="display:flex;justify-content:space-between;align-items:center;">
-                      <div>
-                        <span style="font-family:'Barlow Condensed',sans-serif;font-size:17px;
-                                     font-weight:800;color:#e8f4ff;letter-spacing:0.5px;">
-                          #{ri+1} &nbsp;{r['Symbol']}</span>
+            else:
+                for rank_l, (_, row_l) in enumerate(losers_scan.iterrows(), 1):
+                    bar_w_l = min(row_l["Abs%"] / max(max_abs_move, 0.01) * 100, 100)
+                    st.markdown(f"""
+                    <div style="background:#120103;border:1px solid #401520;
+                                border-left:3px solid #ff3d57;border-radius:3px;
+                                padding:9px 14px;margin:4px 0;position:relative;overflow:hidden;">
+                      <div style="position:absolute;top:0;left:0;width:{bar_w_l:.0f}%;height:100%;
+                                  background:rgba(255,61,87,0.06);pointer-events:none;"></div>
+                      <div style="position:relative;display:flex;justify-content:space-between;
+                                  align-items:center;">
+                        <div>
+                          <span style="font-family:'Barlow Condensed',sans-serif;font-size:11px;
+                                       color:#3a6080;margin-right:8px;">#{rank_l}</span>
+                          <span style="font-family:'Barlow Condensed',sans-serif;font-size:17px;
+                                       font-weight:800;color:#e8f4ff;">{row_l['Symbol']}</span>
+                          <div style="font-family:'JetBrains Mono',monospace;font-size:11px;
+                                      color:#7fa8c8;margin-top:2px;">
+                            LTP ₹{row_l['LTP']:,.2f}
+                            &nbsp;|&nbsp;Prev ₹{row_l['PrevClose']:,.2f}</div>
+                        </div>
+                        <div style="text-align:right;">
+                          <div style="font-family:'JetBrains Mono',monospace;font-size:20px;
+                                      font-weight:700;color:#ff3d57;">
+                            ▼ {abs(row_l['Chg%']):.2f}%</div>
+                          <div style="font-family:'JetBrains Mono',monospace;font-size:12px;
+                                      color:#ff3d57;">-₹{abs(row_l['Chg₹']):,.2f}</div>
+                        </div>
                       </div>
-                      <div style="text-align:right;">
-                        <div style="font-family:'JetBrains Mono',monospace;font-size:18px;
-                                    font-weight:700;color:#ff3d57;">▼ {abs(r['Chg%']):.2f}%</div>
-                        <div style="font-family:'JetBrains Mono',monospace;font-size:11px;
-                                    color:#ff3d57;">-₹{abs(chg_rs):.2f}</div>
-                      </div>
-                    </div>
-                    <div style="display:flex;gap:16px;margin-top:4px;
-                                font-family:'JetBrains Mono',monospace;font-size:11px;color:#7fa8c8;">
-                      <span>LTP: <b style="color:#e8f4ff;">₹{r['LTP']:,.2f}</b></span>
-                      <span>Prev: ₹{r['Prev Close']:,.2f}</span>
-                    </div>
-                  </div>
-                </div>""", unsafe_allow_html=True)
+                    </div>""", unsafe_allow_html=True)
 
-        # ── Full ranked leaderboard (all stocks) ──────────────────────────
+        # ── Full ranked table (ALL scanned stocks) ────────────────────────
         st.markdown("---")
         st.markdown("""<div style="font-family:'Barlow Condensed',sans-serif;font-size:13px;
-            font-weight:700;letter-spacing:2px;color:#7fa8c8;margin-bottom:6px;">
-            📋 ALL STOCKS — RANKED BY MOVE SIZE</div>""", unsafe_allow_html=True)
+            font-weight:700;letter-spacing:2px;color:#7fa8c8;margin-bottom:6px;
+            border-left:3px solid #ff8c00;padding-left:10px;">
+            📋 ALL SCANNED STOCKS — FULL RANKED TABLE</div>""", unsafe_allow_html=True)
 
-        rank_html = """
-        <div style="background:#0d1117;border:1px solid #1e3040;border-radius:3px;overflow:hidden;">
-          <div style="display:grid;grid-template-columns:40px 130px 100px 80px 100px 90px 100%;
-                      padding:7px 14px;border-bottom:1px solid #1e3040;
-                      font-family:'Barlow Condensed',sans-serif;font-size:10px;
-                      letter-spacing:1.5px;color:#3a6080;">
-            <span>#</span><span>SYMBOL</span><span>LTP ₹</span><span>PREV ₹</span>
-            <span>CHG ₹</span><span>CHG %</span><span>MOVE BAR</span>
-          </div>"""
+        if not scan_with_prev.empty:
+            # Build compact HTML table
+            tbl_html = """
+            <div style="background:#0d1117;border:1px solid #1e3040;border-radius:3px;
+                        overflow:hidden;max-height:520px;overflow-y:auto;">
+              <div style="display:grid;
+                          grid-template-columns:36px 110px 90px 90px 80px 80px 1fr;
+                          padding:7px 14px;border-bottom:1px solid #2a3a4a;position:sticky;top:0;
+                          background:#111920;font-family:'Barlow Condensed',sans-serif;
+                          font-size:10px;letter-spacing:1.5px;color:#3a6080;">
+                <span>#</span><span>SYMBOL</span><span>LTP ₹</span>
+                <span>PREV ₹</span><span>CHG ₹</span><span>CHG %</span>
+                <span>MOVE BAR</span>
+              </div>"""
 
-        for ri, (_, r) in enumerate(movers_all.iterrows()):
-            chg_v   = r["Chg%"] or 0
-            chg_rs  = r.get("Chg ₹", 0) or 0
-            col_r   = "#00e676" if chg_v > 0 else "#ff3d57" if chg_v < 0 else "#7fa8c8"
-            arrow_r = "▲" if chg_v > 0 else "▼" if chg_v < 0 else "—"
-            bg_r    = "background:#071008;" if chg_v > 0 else "background:#120307;" if chg_v < 0 else ""
-            bar_fill= min(abs(chg_v) / max(movers_all["AbsChg%"].max(), 0.01) * 100, 100)
-            prev_str = f"₹{r['Prev Close']:,.2f}" if r.get("Prev Close") else "—"
-            rank_html += f"""
-          <div style="display:grid;grid-template-columns:40px 130px 100px 80px 100px 90px 100%;
-                      padding:8px 14px;border-bottom:1px solid #0d1117;{bg_r}
-                      font-family:'JetBrains Mono',monospace;font-size:12px;align-items:center;">
-            <span style="color:#3a6080;font-size:11px;">{ri+1}</span>
-            <span style="font-family:'Barlow Condensed',sans-serif;font-size:14px;
-                         font-weight:800;color:#e8f4ff;">{r['Symbol']}</span>
-            <span style="color:#e8f4ff;font-weight:600;">₹{r['LTP']:,.2f}</span>
-            <span style="color:#7fa8c8;">{prev_str}</span>
-            <span style="color:{col_r};font-weight:600;">
-              {'+' if chg_rs >= 0 else ''}₹{chg_rs:,.2f}</span>
-            <span style="color:{col_r};font-weight:700;">
-              {arrow_r} {abs(chg_v):.2f}%</span>
-            <div style="display:flex;align-items:center;gap:6px;">
-              <div style="background:#1e3040;border-radius:2px;height:6px;flex:1;overflow:hidden;">
-                <div style="width:{bar_fill:.0f}%;background:{col_r};height:100%;
-                             border-radius:2px;box-shadow:0 0 4px {col_r}66;"></div>
-              </div>
-            </div>
-          </div>"""
+            for ri, (_, r) in enumerate(scan_with_prev.iterrows()):
+                cv   = r["Chg%"]
+                cr   = r["Chg₹"]
+                col_ = "#00e676" if cv > 0 else "#ff3d57" if cv < 0 else "#7fa8c8"
+                arr  = "▲" if cv > 0 else "▼" if cv < 0 else "—"
+                bg_  = "background:#020d04;" if cv > 0.5 else "background:#0d0101;" if cv < -0.5 else ""
+                bw_  = min(r["Abs%"] / max(max_abs_move, 0.01) * 100, 100)
+                tbl_html += f"""
+              <div style="display:grid;
+                          grid-template-columns:36px 110px 90px 90px 80px 80px 1fr;
+                          padding:7px 14px;border-bottom:1px solid #0d1117;{bg_}
+                          font-family:'JetBrains Mono',monospace;font-size:12px;
+                          align-items:center;">
+                <span style="color:#3a6080;font-size:10px;">{ri+1}</span>
+                <span style="font-family:'Barlow Condensed',sans-serif;font-size:14px;
+                             font-weight:800;color:#e8f4ff;">{r['Symbol']}</span>
+                <span style="color:#e8f4ff;font-weight:600;">₹{r['LTP']:,.2f}</span>
+                <span style="color:#7fa8c8;">₹{r['PrevClose']:,.2f}</span>
+                <span style="color:{col_};font-weight:600;">{'+' if cr>=0 else ''}₹{cr:,.2f}</span>
+                <span style="color:{col_};font-weight:700;">{arr} {abs(cv):.2f}%</span>
+                <div style="background:#1e3040;border-radius:2px;height:5px;overflow:hidden;">
+                  <div style="width:{bw_:.0f}%;background:{col_};height:100%;
+                               box-shadow:0 0 4px {col_}55;"></div>
+                </div>
+              </div>"""
 
-        rank_html += "</div>"
-        st.markdown(rank_html, unsafe_allow_html=True)
+            tbl_html += "</div>"
+            st.markdown(tbl_html, unsafe_allow_html=True)
 
+        if not scan_ltp_only.empty:
+            with st.expander(f"⏳ {len(scan_ltp_only)} stocks — LTP available but prev close missing"):
+                st.markdown("""<div style="font-family:'Barlow Condensed',sans-serif;
+                    font-size:11px;color:#3a6080;letter-spacing:1px;padding:6px;">
+                    These stocks have live LTP but prev close failed to load.
+                    Click 'Reset Prev Close' and refresh to retry.</div>""",
+                    unsafe_allow_html=True)
+                ltp_only_html = ""
+                for _, rr in scan_ltp_only.iterrows():
+                    ltp_only_html += (
+                        f'<span style="background:#0d1117;border:1px solid #1e3040;color:#7fa8c8;'
+                        f'font-family:Barlow Condensed,sans-serif;font-size:13px;font-weight:700;'
+                        f'padding:4px 10px;border-radius:3px;margin:3px;display:inline-block;">'
+                        f'{rr["Symbol"]} ₹{rr["LTP"]:,.2f}</span>'
+                    )
+                st.markdown(f'<div style="display:flex;flex-wrap:wrap;gap:4px;padding:6px;">{ltp_only_html}</div>',
+                            unsafe_allow_html=True)
+
+    # ======================================================
     # ======================================================
