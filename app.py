@@ -26,7 +26,6 @@ import tab3_positions
 import tab4_snr_pain
 import tab5_ai_advisor
 import tab6_trade_log
-import tab7_greeks_lab
 import tab8_stocks
 import tab9_chart
 import tab10_history
