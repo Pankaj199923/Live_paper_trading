@@ -25,16 +25,19 @@ from chart_utils import (compute_technicals, compute_order_flow, detect_liquidit
 # TAB 8 — STOCKS TERMINAL
 # ======================================================
 def render():
+    import streamlit as st
+    import pandas as pd
+
     st.session_state["active_tab_key"] = "🖥 STOCKS"
 
     st.title("📊 NSE STOCKS — AUTO SCANNER")
 
     if instrument_df.empty:
-        st.warning("NSECMI.csv not found")
+        st.warning("❌ instrument_df not loaded")
         return
 
     # ==============================
-    # 🔹 FILTER SETTINGS
+    # 🔹 FILTER UI
     # ==============================
     col1, col2, col3 = st.columns(3)
 
@@ -45,47 +48,84 @@ def render():
         direction = st.selectbox("Direction", ["UP", "DOWN", "BOTH"])
 
     with col3:
-        refresh_btn = st.button("🔄 Refresh")
+        refresh = st.button("🔄 Refresh")
 
     # ==============================
-    # 🔹 USE ALL STOCKS
+    # 🔹 ALL STOCKS
     # ==============================
-    sel_df8 = instrument_df.copy()
+    sel_df = instrument_df.copy()
 
-    rows8 = []
+    if sel_df.empty:
+        st.warning("No instruments found")
+        return
 
-    for _, row in sel_df8.iterrows():
+    # ==============================
+    # 🔥 FAST LTP FETCH (ONE CALL)
+    # ==============================
+    try:
+        keys = sel_df["instrument_key"].tolist()
+        ltp_df = fetch_ltp(keys)
+
+        if ltp_df.empty:
+            st.error("❌ LTP API returned empty")
+            return
+
+        # Map LTP
+        ltp_map = dict(zip(ltp_df["instrument_key"], ltp_df["Spot Price"]))
+
+    except Exception as e:
+        st.error(f"LTP Fetch Error: {e}")
+        return
+
+    # ==============================
+    # 🔹 BUILD DATA
+    # ==============================
+    rows = []
+
+    for _, row in sel_df.iterrows():
         sym = row["Symbol"]
+        key = row["instrument_key"]
 
-        try:
-            ltp_df = fetch_ltp([row["instrument_key"]])
-            ltp = float(ltp_df["Spot Price"].iloc[0]) if not ltp_df.empty else None
-        except:
-            ltp = None
+        ltp = ltp_map.get(key, None)
 
+        # 🔥 FETCH PREV CLOSE (CACHED)
         prev_close = st.session_state.get(f"prev_close_{sym}")
 
         if prev_close is None:
-            try:
-                prev_close = row.get("Close", None)  # fallback
-            except:
-                prev_close = None
+            prev_close = _fetch_prev_close(key)
+            if prev_close:
+                st.session_state[f"prev_close_{sym}"] = prev_close
 
-        chg = ((ltp - prev_close) / prev_close * 100) if ltp and prev_close else 0
-        chg_rs = (ltp - prev_close) if ltp and prev_close else 0
+        # Calculate change
+        if ltp and prev_close and prev_close > 0:
+            chg_pct = ((ltp - prev_close) / prev_close) * 100
+            chg_rs = ltp - prev_close
+        else:
+            chg_pct = None
+            chg_rs = None
 
-        rows8.append({
+        rows.append({
             "Symbol": sym,
             "LTP": ltp,
             "Prev Close": prev_close,
-            "Chg%": chg,
+            "Chg%": chg_pct,
             "Chg ₹": chg_rs
         })
 
-    df = pd.DataFrame(rows8)
+    df = pd.DataFrame(rows)
 
     # ==============================
-    # 🔹 APPLY % FILTER
+    # 🔥 CLEAN DATA (IMPORTANT)
+    # ==============================
+    df = df.dropna(subset=["LTP", "Prev Close", "Chg%"])
+
+    if df.empty:
+        st.warning("⚠️ No valid data (LTP/Prev Close missing)")
+        st.write(df.head())
+        return
+
+    # ==============================
+    # 🔹 APPLY FILTER
     # ==============================
     if direction == "UP":
         df = df[df["Chg%"] >= min_pct]
@@ -96,26 +136,27 @@ def render():
     else:
         df = df[abs(df["Chg%"]) >= min_pct]
 
+    if df.empty:
+        st.warning("⚠️ No stocks match filter — try lowering %")
+        return
+
     # ==============================
-    # 🔥 TOP 50 MOVERS ONLY
+    # 🔥 TOP 50 MOVERS
     # ==============================
     df["AbsChg"] = df["Chg%"].abs()
     df = df.sort_values("AbsChg", ascending=False).head(50)
 
     # ==============================
-    # 🔹 DISPLAY
+    # 🔹 DISPLAY TABLE
     # ==============================
     st.subheader(f"🔥 Top 50 Movers ({direction} | > {min_pct}%)")
 
-    if df.empty:
-        st.warning("No stocks match criteria")
-        return
-
-    # Table display
     df_display = df[["Symbol", "LTP", "Prev Close", "Chg ₹", "Chg%"]].copy()
 
-    df_display["Chg%"] = df_display["Chg%"].round(2)
     df_display["LTP"] = df_display["LTP"].round(2)
+    df_display["Prev Close"] = df_display["Prev Close"].round(2)
+    df_display["Chg%"] = df_display["Chg%"].round(2)
+    df_display["Chg ₹"] = df_display["Chg ₹"].round(2)
 
     st.dataframe(df_display, use_container_width=True)
 
@@ -130,3 +171,9 @@ def render():
     col1.metric("Total Stocks", len(df))
     col2.metric("Gainers", adv)
     col3.metric("Losers", dec)
+
+    # ==============================
+    # 🔍 DEBUG (REMOVE LATER)
+    # ==============================
+    with st.expander("🔍 Debug Data"):
+        st.write(df.head())
