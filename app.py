@@ -364,14 +364,13 @@ def render_header():
 # ======================
 render_header()
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab8, tab9, tab10, tab11, tab12 = st.tabs([
     "OPTION CHAIN",
     "SMART MONEY",
     "POSITIONS",
     "S&R / PAIN",
     "AI ADVISOR",
     "TRADE LOG",
-    "GREEKS LAB",
     "\U0001f5a5 STOCKS",
     "\U0001f4ca CHART",
     "\U0001f4f8 HISTORY",
