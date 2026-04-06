@@ -28,7 +28,7 @@ import tab5_ai_advisor
 import tab6_trade_log
 import tab8_stocks
 import tab9_chart
-import tab10_history
+# import tab10_history
 import tab11_basket
 import tab12_paper_trading
 
@@ -373,7 +373,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab8, tab9, tab10, tab11, tab12 = st.tabs([
     "TRADE LOG",
     "\U0001f5a5 STOCKS",
     "\U0001f4ca CHART",
-    "\U0001f4f8 HISTORY",
+    # "\U0001f4f8 HISTORY",
     "\U0001f9fa BASKET",
     "\U0001f3ae PAPER_Trade",
 ])
@@ -387,6 +387,6 @@ with tab6:  tab6_trade_log.render()
 # with tab7:  tab7_greeks_lab.render()
 with tab8:  tab8_stocks.render()
 with tab9:  tab9_chart.render()
-with tab10: tab10_history.render()
+# with tab10: tab10_history.render()
 with tab11: tab11_basket.render()
 with tab12: tab12_paper_trading.render()
