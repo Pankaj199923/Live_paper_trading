@@ -498,7 +498,7 @@ def render():
         if "CE_Volume" in oc_vs.columns and "PE_Volume" in oc_vs.columns:
             avg_ce_vol      = oc_vs["CE_Volume"].mean()
             avg_pe_vol      = oc_vs["PE_Volume"].mean()
-            spike_threshold = 2.0
+            spike_threshold = 2.5
             ce_spikes       = oc_vs[oc_vs["CE_Volume"] >= avg_ce_vol * spike_threshold].copy()
             pe_spikes       = oc_vs[oc_vs["PE_Volume"] >= avg_pe_vol * spike_threshold].copy()
             atm_vs          = get_atm_strike(spot2, sel_idx2)
