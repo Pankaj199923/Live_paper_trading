@@ -327,7 +327,7 @@ def render():
                     <div style="font-family:'Barlow Condensed',sans-serif;font-size:16px;font-weight:700;color:{ob_color};margin-top:3px;">{overall_bias}</div></div>""", unsafe_allow_html=True)
 
             ce_pct_split = total_ce_oi / max(total_ce_oi + total_pe_oi, 1) * 100
-            pe_pct_split = 100 - ce_pct_split
+            pe_pct_split = total_pe_oi / max(total_ce_oi + total_pe_oi, 1) * 100
             st.markdown(f"""<div style="margin:10px 0 4px 0;font-family:'Barlow Condensed',sans-serif;font-size:9px;letter-spacing:1.5px;color:#3a6080;">
               TOTAL OI SPLIT - CE {ce_pct_split:.1f}% | PE {pe_pct_split:.1f}%</div>
             <div style="display:flex;height:8px;border-radius:4px;overflow:hidden;margin-bottom:12px;">
