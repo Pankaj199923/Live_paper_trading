@@ -498,7 +498,7 @@ def render():
         if "CE_Volume" in oc_vs.columns and "PE_Volume" in oc_vs.columns:
             avg_ce_vol      = oc_vs["CE_Volume"].mean()
             avg_pe_vol      = oc_vs["PE_Volume"].mean()
-            spike_threshold = 2.5
+            spike_threshold = 2.0
             ce_spikes       = oc_vs[oc_vs["CE_Volume"] >= avg_ce_vol * spike_threshold].copy()
             pe_spikes       = oc_vs[oc_vs["PE_Volume"] >= avg_pe_vol * spike_threshold].copy()
             atm_vs          = get_atm_strike(spot2, sel_idx2)
@@ -627,7 +627,7 @@ def render():
                         <div style="font-size:11px;color:#ff8c00;">{top_spike['vs Avg']} of avg volume</div></div>""", unsafe_allow_html=True)
 
                 ce_pct_bar = total_ce_oi_vs / max(total_oi_sum, 1) * 100
-                pe_pct_bar = 100 - ce_pct_bar
+                pe_pct_bar = total_pe_oi_vs / max(total_oi_sum, 1) * 100
                 st.markdown(f"""<div style="margin:10px 0 4px 0;font-family:'Barlow Condensed',sans-serif;font-size:9px;letter-spacing:1.5px;color:#3a6080;">
                   TOTAL OI SPLIT - CE {ce_pct_bar:.1f}% vs PE {pe_pct_bar:.1f}%</div>
                 <div style="display:flex;height:8px;border-radius:4px;overflow:hidden;margin-bottom:12px;">
