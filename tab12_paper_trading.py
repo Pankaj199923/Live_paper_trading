@@ -55,37 +55,22 @@ import os as _os
 import anthropic as _ant
 
 def _get_anthropic_client() -> _ant.Anthropic:
-    """
-    Return a cached Anthropic client, resolving the API key in this order:
-      1. st.secrets["ANTHROPIC_API_KEY"]   ← Streamlit Cloud / secrets.toml
-      2. st.secrets["anthropic"]["api_key"] ← nested secrets.toml style
-      3. os.environ["ANTHROPIC_API_KEY"]    ← local .env / system env
-      4. config module's ANTHROPIC_API_KEY  ← if your config.py exports it
-    Raises RuntimeError with a clear message if none found.
-    """
     if "pt_anthropic_client" in st.session_state:
         return st.session_state.pt_anthropic_client
 
     api_key = None
-
-    # 1 & 2 — Streamlit secrets
     try:
         api_key = st.secrets.get("ANTHROPIC_API_KEY") or st.secrets.get("anthropic", {}).get("api_key")
     except Exception:
         pass
-
-    # 3 — environment variable
     if not api_key:
         api_key = _os.environ.get("ANTHROPIC_API_KEY")
-
-    # 4 — config module
     if not api_key:
         try:
             import config as _cfg
             api_key = getattr(_cfg, "ANTHROPIC_API_KEY", None)
         except Exception:
             pass
-
     if not api_key:
         raise RuntimeError(
             "Anthropic API key not found. Add it to:\n"
@@ -95,8 +80,30 @@ def _get_anthropic_client() -> _ant.Anthropic:
         )
 
     client = _ant.Anthropic(api_key=api_key)
-    st.session_state.pt_anthropic_client = client   # cache for session lifetime
+    st.session_state.pt_anthropic_client = client
     return client
+
+
+# ─────────────────────────────────────────────────────────────
+# FIX A: Strike-indexed DataFrame helper
+# Builds a Strike→row index once per render and reuses everywhere.
+# Eliminates all oc_df[oc_df["Strike"] == x] scans (O(n) each)
+# and replaces with O(1) .at[strike, col] lookups.
+# ─────────────────────────────────────────────────────────────
+def _build_oc_index(oc_df: pd.DataFrame) -> pd.DataFrame:
+    """Return oc_df indexed by Strike for O(1) lookups."""
+    if oc_df.index.name == "Strike":
+        return oc_df
+    return oc_df.set_index("Strike")
+
+
+def _ltp_from_index(oc_idx: pd.DataFrame, strike, opt_type: str, fallback: float = 0.0) -> float:
+    """Safe O(1) LTP lookup from the pre-indexed DataFrame."""
+    col = f"{opt_type}_LTP"
+    try:
+        return round(float(oc_idx.at[strike, col]), 2)
+    except (KeyError, TypeError, ValueError):
+        return fallback
 
 
 # ─────────────────────────────────────────────────────────────
@@ -114,21 +121,21 @@ def _init_pt_state():
             "losses":         0,
         }
     if "pt_open_trades" not in st.session_state:
-        st.session_state.pt_open_trades = []        # list[dict]
+        st.session_state.pt_open_trades = []
     if "pt_closed_trades" not in st.session_state:
-        st.session_state.pt_closed_trades = []      # list[dict]
+        st.session_state.pt_closed_trades = []
     if "pt_journal" not in st.session_state:
-        st.session_state.pt_journal = []            # list[dict]  — AI reasoning per trade
+        st.session_state.pt_journal = []
     if "pt_equity_curve" not in st.session_state:
         st.session_state.pt_equity_curve = [
             {"time": now_ist_dt.strftime("%H:%M"), "equity": DEFAULT_CAPITAL}
         ]
     if "pt_pending_ai" not in st.session_state:
-        st.session_state.pt_pending_ai = {}         # trade_id → True while generating
+        st.session_state.pt_pending_ai = {}
     if "pt_reset_confirm" not in st.session_state:
         st.session_state.pt_reset_confirm = False
     if "pt_suggest_result" not in st.session_state:
-        st.session_state.pt_suggest_result = None   # last AI suggestion dict
+        st.session_state.pt_suggest_result = None
     if "pt_suggest_loading" not in st.session_state:
         st.session_state.pt_suggest_loading = False
 
@@ -143,15 +150,14 @@ def _compute_costs(action: str, premium: float, qty: int, lots: int) -> float:
 
 
 # ─────────────────────────────────────────────────────────────
-# MARGIN ESTIMATOR  (SPAN-like flat approximation)
+# MARGIN ESTIMATOR
 # ─────────────────────────────────────────────────────────────
 def _estimate_margin(action: str, premium: float, strike: float, lots: int, lot_size: int) -> float:
     if action == "BUY":
         return premium * lots * lot_size
     else:
-        # SELL margin ≈ 10–15 % of notional + premium received
         notional = strike * lots * lot_size
-        return round(notional * 0.10 + premium * lots * lot_size, 0)
+        return round(notional * 0.12 + premium * lots * lot_size, 0)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -163,16 +169,20 @@ def _execute_paper_trade(
     sl_pts, target_pts,
     tech_summary, signal_scores,
     custom_reason="",
+    oc_idx=None,                 # FIX A: accept pre-built index
 ) -> dict | None:
-    """Execute a simulated trade and generate AI reasoning."""
     lot_size  = get_lot_size(index_key)
     qty       = lots * lot_size
-    col_ltp   = f"{opt_type}_LTP"
-    row       = oc_df[oc_df["Strike"] == strike]
-    if row.empty:
-        st.error(f"Strike {strike} not found in option chain.")
-        return None
-    premium   = round(float(row[col_ltp].values[0]), 2)
+
+    # FIX A: use pre-built index if available, else build it here
+    if oc_idx is None:
+        oc_idx = _build_oc_index(oc_df)
+    premium = _ltp_from_index(oc_idx, strike, opt_type)
+    if premium <= 0:
+        # Fallback: try raw DataFrame (strike might be float-keyed)
+        row = oc_df[oc_df["Strike"] == strike]
+        col_ltp = f"{opt_type}_LTP"
+        premium = round(float(row[col_ltp].values[0]), 2) if not row.empty else 0.0
     if premium <= 0:
         st.error("LTP is zero — cannot execute.")
         return None
@@ -185,7 +195,6 @@ def _execute_paper_trade(
         st.error(f"❌ Insufficient margin. Need ₹{margin:,.0f}, available ₹{acct['available']:,.0f}")
         return None
 
-    # Direction-aware SL & Target
     if action == "BUY":
         sl_price     = round(premium - sl_pts, 2)
         target_price = round(premium + target_pts, 2)
@@ -233,31 +242,30 @@ def _execute_paper_trade(
         "macd_cross":    tech_summary.get("macd_cross", ""),
         "price_vs_vwap": tech_summary.get("price_vs_vwap", ""),
         "atr14":         tech_summary.get("atr14", 0),
-        "ai_reasoning":  None,      # filled async
+        "ai_reasoning":  None,
     }
 
-    # Debit margin
-    acct["available"]  = round(acct["available"] - margin, 2)
+    acct["available"]   = round(acct["available"] - margin, 2)
     acct["total_trades"] += 1
-
     st.session_state.pt_open_trades.append(trade)
     st.session_state.pt_pending_ai[trade_id] = True
-
     return trade
 
 
 # ─────────────────────────────────────────────────────────────
 # CLOSE TRADE
 # ─────────────────────────────────────────────────────────────
-def _close_trade(trade_id: str, oc_df, reason: str = "MANUAL"):
+def _close_trade(trade_id: str, oc_df, reason: str = "MANUAL", oc_idx=None):
     trades = st.session_state.pt_open_trades
     idx    = next((i for i, t in enumerate(trades) if t["id"] == trade_id), None)
     if idx is None:
         return
-    trade    = trades[idx]
-    col_ltp  = f"{trade['opt_type']}_LTP"
-    row      = oc_df[oc_df["Strike"] == trade["strike"]]
-    exit_ltp = round(float(row[col_ltp].values[0]), 2) if not row.empty else trade["ltp"]
+    trade = trades[idx]
+
+    # FIX A: use pre-built index
+    if oc_idx is None:
+        oc_idx = _build_oc_index(oc_df)
+    exit_ltp = _ltp_from_index(oc_idx, trade["strike"], trade["opt_type"], trade["ltp"])
 
     if trade["action"] == "BUY":
         pnl_pts = round(exit_ltp - trade["entry_price"], 2)
@@ -276,19 +284,17 @@ def _close_trade(trade_id: str, oc_df, reason: str = "MANUAL"):
         "ltp":         exit_ltp,
     })
 
-    # Return margin + realised PnL
     acct = st.session_state.pt_account
     acct["available"] = round(acct["available"] + trade["margin_used"] + pnl_net, 2)
     acct["peak"]      = max(acct["peak"], acct["available"])
     if pnl_net >= 0:
-        acct["wins"]    += 1
+        acct["wins"]   += 1
     else:
-        acct["losses"]  += 1
+        acct["losses"] += 1
 
     st.session_state.pt_closed_trades.append(trade)
     st.session_state.pt_open_trades.pop(idx)
 
-    # Equity snapshot
     st.session_state.pt_equity_curve.append({
         "time":   now_ist_dt.strftime("%H:%M"),
         "equity": acct["available"],
@@ -296,16 +302,18 @@ def _close_trade(trade_id: str, oc_df, reason: str = "MANUAL"):
 
 
 # ─────────────────────────────────────────────────────────────
-# LIVE PNL UPDATE FOR OPEN TRADES
+# FIX B: LIVE PNL — single-pass with pre-indexed DF
+# Old: N separate DataFrame scans (one per open trade)
+# New: one .set_index() call, then O(1) lookups per trade
 # ─────────────────────────────────────────────────────────────
-def _update_live_pnl(oc_df):
+def _update_live_pnl(oc_df, oc_idx=None):
+    if oc_idx is None:
+        oc_idx = _build_oc_index(oc_df)
+
     for trade in st.session_state.pt_open_trades:
-        col_ltp = f"{trade['opt_type']}_LTP"
-        row     = oc_df[oc_df["Strike"] == trade["strike"]]
-        if row.empty:
-            continue
-        ltp = round(float(row[col_ltp].values[0]), 2)
+        ltp = _ltp_from_index(oc_idx, trade["strike"], trade["opt_type"], trade["ltp"])
         trade["ltp"] = ltp
+
         if trade["action"] == "BUY":
             pnl_pts = round(ltp - trade["entry_price"], 2)
             sl_hit  = ltp <= trade["sl_price"]
@@ -318,25 +326,22 @@ def _update_live_pnl(oc_df):
         trade["pnl_pts"] = pnl_pts
         trade["pnl"]     = round(pnl_pts * trade["qty"] - trade["costs"], 2)
 
-        # Auto-close on SL / Target
         if trade["status"] == "OPEN":
             if sl_hit:
                 trade["status"] = "SL_PENDING"
             elif tgt_hit:
                 trade["status"] = "TGT_PENDING"
 
-    # Batch close SL/Target hits
-    to_close = [(t["id"], "SL HIT") for t in st.session_state.pt_open_trades if t["status"] == "SL_PENDING"]
+    to_close = [(t["id"], "SL HIT")     for t in st.session_state.pt_open_trades if t["status"] == "SL_PENDING"]
     to_close += [(t["id"], "TARGET HIT") for t in st.session_state.pt_open_trades if t["status"] == "TGT_PENDING"]
     for tid, reason in to_close:
-        _close_trade(tid, oc_df, reason)
+        _close_trade(tid, oc_df, reason, oc_idx=oc_idx)
 
 
 # ─────────────────────────────────────────────────────────────
 # AI REASONING GENERATOR
 # ─────────────────────────────────────────────────────────────
 def _generate_ai_reasoning(trade: dict, oc_df, tech_summary: dict, spot: float) -> str:
-    """Generate a rich, structured AI reasoning note for a trade."""
     try:
         client = _get_anthropic_client()
 
@@ -420,32 +425,37 @@ Be direct, professional, and specific. Mention actual price levels. No fluff."""
 
 
 # ─────────────────────────────────────────────────────────────
-# TRADE SUGGEST ENGINE  ← AI-powered full data analysis
+# TRADE SUGGEST ENGINE
 # ─────────────────────────────────────────────────────────────
 def _build_suggest_prompt(
     oc_df, spot: float, index_key: str, expiry: str,
     tech_sum: dict, signal_scores: dict,
     perf: dict, closed_trades: list, open_trades: list,
+    oc_idx=None,                 # FIX A: accept pre-built index
 ) -> str:
-    """Build a comprehensive prompt feeding ALL available data to Claude."""
     atm = get_atm_strike(spot, index_key)
     index_name = INDEX_SHORT.get(index_key, index_key.split("|")[-1])
 
-    # ── Option chain snapshot (ATM ±5 strikes) ──
+    # FIX A: use pre-built index for option chain snapshot
+    if oc_idx is None:
+        oc_idx = _build_oc_index(oc_df)
+
     strikes_all = sorted(oc_df["Strike"].unique().tolist())
     atm_pos = strikes_all.index(atm) if atm in strikes_all else len(strikes_all) // 2
     nearby = strikes_all[max(0, atm_pos - 5): atm_pos + 6]
+
     oc_rows = []
     for s in nearby:
-        r = oc_df[oc_df["Strike"] == s]
-        if r.empty:
-            continue
-        ce_ltp = r.get("CE_LTP", r.iloc[:, 0]).values[0] if "CE_LTP" in r.columns else "—"
-        pe_ltp = r.get("PE_LTP", r.iloc[:, 0]).values[0] if "PE_LTP" in r.columns else "—"
-        ce_oi  = r.get("CE_OI",  r.iloc[:, 0]).values[0] if "CE_OI"  in r.columns else "—"
-        pe_oi  = r.get("PE_OI",  r.iloc[:, 0]).values[0] if "PE_OI"  in r.columns else "—"
-        ce_iv  = r.get("CE_IV",  r.iloc[:, 0]).values[0] if "CE_IV"  in r.columns else "—"
-        pe_iv  = r.get("PE_IV",  r.iloc[:, 0]).values[0] if "PE_IV"  in r.columns else "—"
+        try:
+            row_vals = oc_idx.loc[s]
+            ce_ltp = row_vals.get("CE_LTP", "—")
+            pe_ltp = row_vals.get("PE_LTP", "—")
+            ce_oi  = row_vals.get("CE_OI",  "—")
+            pe_oi  = row_vals.get("PE_OI",  "—")
+            ce_iv  = row_vals.get("CE_IV",  "—")
+            pe_iv  = row_vals.get("PE_IV",  "—")
+        except KeyError:
+            ce_ltp = pe_ltp = ce_oi = pe_oi = ce_iv = pe_iv = "—"
         marker = " ← ATM" if s == atm else ""
         oc_rows.append(
             f"  {int(s):>6}{marker:<8}  CE LTP={ce_ltp}  CE OI={ce_oi}  CE IV={ce_iv}  "
@@ -453,9 +463,8 @@ def _build_suggest_prompt(
         )
     oc_snapshot = "\n".join(oc_rows) if oc_rows else "  (option chain data unavailable)"
 
-    # ── Historical trade summary ──
     hist_lines = []
-    for t in (closed_trades or [])[-20:]:          # last 20 closed trades
+    for t in (closed_trades or [])[-20:]:
         pnl_tag = f"+₹{t['pnl']:,.0f}" if t.get("pnl", 0) >= 0 else f"-₹{abs(t.get('pnl',0)):,.0f}"
         hist_lines.append(
             f"  [{t.get('date','')} {t.get('timestamp','')}] "
@@ -467,7 +476,6 @@ def _build_suggest_prompt(
         )
     hist_block = "\n".join(hist_lines) if hist_lines else "  No closed trade history yet."
 
-    # ── Open positions ──
     open_lines = []
     for t in (open_trades or []):
         open_lines.append(
@@ -477,7 +485,6 @@ def _build_suggest_prompt(
         )
     open_block = "\n".join(open_lines) if open_lines else "  No open positions."
 
-    # ── Performance stats ──
     if perf:
         perf_block = (
             f"  Total trades  : {perf.get('total_trades',0)}\n"
@@ -600,12 +607,11 @@ Be direct. Be specific. Use actual numbers. No generic advice."""
 def _generate_trade_suggestion(
     oc_df, spot: float, index_key: str, expiry: str,
     tech_sum: dict, signal_scores: dict,
+    oc_idx=None,
 ) -> dict:
-    """Call Claude to generate a trade suggestion. Returns dict with text + metadata."""
     try:
         client = _get_anthropic_client()
-
-        perf         = _calc_performance()
+        perf          = _calc_performance()
         closed_trades = st.session_state.pt_closed_trades
         open_trades   = st.session_state.pt_open_trades
 
@@ -613,6 +619,7 @@ def _generate_trade_suggestion(
             oc_df, spot, index_key, expiry,
             tech_sum, signal_scores,
             perf, closed_trades, open_trades,
+            oc_idx=oc_idx,
         )
 
         resp = client.messages.create(
@@ -622,7 +629,6 @@ def _generate_trade_suggestion(
         )
         text = resp.content[0].text.strip()
 
-        # Extract key fields for display badge
         action     = "BUY"  if "**Action:** BUY"  in text else "SELL" if "**Action:** SELL" in text else "—"
         confidence = "High" if "High"  in text[:600] else "Medium" if "Medium" in text[:600] else "Low"
 
@@ -648,11 +654,11 @@ def _generate_trade_suggestion(
 def _render_trade_suggest_section(
     oc_df, spot: float, index_key: str, expiry: str,
     tech_sum: dict, signal_scores: dict,
+    perf: dict,            # FIX C: accept pre-computed perf — no double call
+    oc_idx=None,
 ):
-    """Render the full Trade Suggest panel inside the main render() function."""
     st.markdown("---")
 
-    # ── Section header ─────────────────────────────────────────────────
     st.markdown("""
     <div style="display:flex;align-items:center;gap:12px;margin-bottom:4px;">
       <div style="font-family:'Barlow Condensed',sans-serif;font-size:20px;
@@ -667,8 +673,7 @@ def _render_trade_suggest_section(
       Analyses live option chain · technicals · your full trade history · account state → one actionable suggestion
     </div>""", unsafe_allow_html=True)
 
-    # ── Data freshness bar ─────────────────────────────────────────────
-    perf = _calc_performance()
+    # FIX C: perf already computed by caller — no second _calc_performance() call
     closed_n  = len(st.session_state.pt_closed_trades)
     open_n    = len(st.session_state.pt_open_trades)
     bull_s    = signal_scores.get("bull", 0)
@@ -695,7 +700,6 @@ def _render_trade_suggest_section(
       {'<span style="color:#00e676;">✓ PERF STATS INCLUDED</span>' if perf else '<span style="color:#3a6080;">⚠ NO HISTORY YET</span>'}
     </div>""", unsafe_allow_html=True)
 
-    # ── Generate button + last result display ──────────────────────────
     btn_col, info_col = st.columns([1, 2])
 
     with btn_col:
@@ -707,7 +711,8 @@ def _render_trade_suggest_section(
         ):
             with st.spinner("🧠 Claude is analysing your full trading data…"):
                 result = _generate_trade_suggestion(
-                    oc_df, spot, index_key, expiry, tech_sum, signal_scores
+                    oc_df, spot, index_key, expiry, tech_sum, signal_scores,
+                    oc_idx=oc_idx,
                 )
                 st.session_state.pt_suggest_result = result
             st.rerun()
@@ -720,8 +725,8 @@ def _render_trade_suggest_section(
     with info_col:
         res = st.session_state.pt_suggest_result
         if res:
-            action_c    = "#00e676" if res["action"] == "BUY" else "#ff3d57" if res["action"] == "SELL" else "#7fa8c8"
-            conf_c      = "#00e676" if res["confidence"] == "High" else "#ffd600" if res["confidence"] == "Medium" else "#ff3d57"
+            action_c = "#00e676" if res["action"] == "BUY" else "#ff3d57" if res["action"] == "SELL" else "#7fa8c8"
+            conf_c   = "#00e676" if res["confidence"] == "High" else "#ffd600" if res["confidence"] == "Medium" else "#ff3d57"
             st.markdown(f"""
             <div style="background:#0d1117;border:1px solid #2a3a4a;border-radius:3px;
                         padding:8px 14px;font-family:'JetBrains Mono',monospace;font-size:11px;">
@@ -746,12 +751,9 @@ def _render_trade_suggest_section(
               NO SUGGESTION GENERATED YET — CLICK THE BUTTON TO ANALYSE ALL DATA
             </div>""", unsafe_allow_html=True)
 
-    # ── Display the full AI suggestion ────────────────────────────────
     res = st.session_state.pt_suggest_result
     if res and res.get("text"):
         st.markdown("<div style='margin-top:8px;'></div>", unsafe_allow_html=True)
-
-        # Wrap the AI output in a styled container
         st.markdown("""
         <div style="background:#0a0f1a;border:1px solid #2a3a5a;border-left:3px solid #c084fc;
                     border-radius:3px;padding:18px 20px;margin-top:4px;">
@@ -759,13 +761,8 @@ def _render_trade_suggest_section(
                       letter-spacing:2px;color:#c084fc;margin-bottom:10px;">
             AI TRADE SUGGESTION — EDUCATIONAL USE ONLY · NOT FINANCIAL ADVICE
           </div>""", unsafe_allow_html=True)
-
         st.markdown(res["text"])
-
         st.markdown("</div>", unsafe_allow_html=True)
-
-        # ── One-click execute from suggestion ─────────────────────────
-        st.markdown("<div style='margin-top:10px;'></div>", unsafe_allow_html=True)
         st.info(
             "💡 Review the suggestion carefully. Use the **Order Entry** panel on the left "
             "to place the trade manually with your own SL/Target/Lots. "
@@ -775,7 +772,7 @@ def _render_trade_suggest_section(
 
 
 # ─────────────────────────────────────────────────────────────
-# PERFORMANCE METRICS
+# FIX C: PERFORMANCE METRICS — cached per render
 # ─────────────────────────────────────────────────────────────
 def _calc_performance() -> dict:
     closed = st.session_state.pt_closed_trades
@@ -867,18 +864,17 @@ def _trade_card_html(trade: dict) -> str:
     pnl_c = "#00e676" if pnl >= 0 else "#ff3d57"
     ac    = "#00e676" if trade["action"] == "BUY" else "#ff3d57"
     tc    = "#ff3d57" if trade["opt_type"] == "CE" else "#00e676"
-    # Progress bar toward target
     entry = trade["entry_price"]
     tgt   = trade["target_price"]
     sl    = trade["sl_price"]
     ltp   = trade.get("ltp", entry)
     if trade["action"] == "BUY":
-        prog = min(max((ltp - entry) / (tgt - entry + 0.001) * 100, 0), 100)
+        prog    = min(max((ltp - entry) / (tgt - entry + 0.001) * 100, 0), 100)
         sl_prog = min(max((entry - ltp) / (entry - sl + 0.001) * 100, 0), 100)
     else:
-        prog = min(max((entry - ltp) / (entry - tgt + 0.001) * 100, 0), 100)
+        prog    = min(max((entry - ltp) / (entry - tgt + 0.001) * 100, 0), 100)
         sl_prog = min(max((ltp - entry) / (sl - entry + 0.001) * 100, 0), 100)
-    bar_c = "#00e676" if prog > 50 else "#ffd600" if prog > 20 else "#7fa8c8"
+    bar_c    = "#00e676" if prog > 50 else "#ffd600" if prog > 20 else "#7fa8c8"
     sl_bar_c = "#ff3d57" if sl_prog > 50 else "#ff8c00" if sl_prog > 25 else "#3a6080"
 
     return f"""
@@ -918,7 +914,6 @@ def _trade_card_html(trade: dict) -> str:
         {trade.get('pnl_pts',0):+.2f} pts · Mrgn ₹{trade['margin_used']:,.0f}</div>
     </div>
   </div>
-  <!-- Target Progress Bar -->
   <div style="margin-top:8px;">
     <div style="display:flex;justify-content:space-between;
                 font-family:'Barlow Condensed',sans-serif;font-size:9px;
@@ -933,7 +928,6 @@ def _trade_card_html(trade: dict) -> str:
       <div style="width:{sl_prog:.0f}%;background:{sl_bar_c};border-radius:2px;transition:width 0.3s;"></div>
     </div>
   </div>
-  <!-- Signal context chips -->
   <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;">
     <span style="background:#0d1117;border:1px solid #1e3040;color:#7fa8c8;
                  font-family:'Barlow Condensed',sans-serif;font-size:9px;
@@ -987,7 +981,7 @@ def _closed_card_html(trade: dict) -> str:
 # EQUITY CURVE CHART
 # ─────────────────────────────────────────────────────────────
 def _equity_chart():
-    ec   = st.session_state.pt_equity_curve
+    ec = st.session_state.pt_equity_curve
     if len(ec) < 2 or not HAS_PLOTLY:
         return
     times  = [e["time"] for e in ec]
@@ -1056,13 +1050,11 @@ def render():
     st.session_state["active_tab_key"] = "🎮 PAPER"
     _init_pt_state()
 
-    # ── Live data deps ────────────────────────────────────────────────
     oc_df   = st.session_state.get("current_option_chain", pd.DataFrame())
     spot    = st.session_state.get("current_spot_price", 0)
     sel_idx = st.session_state.get("current_selected_index", "")
     expiry  = st.session_state.get("oc_expiry_select", "")
 
-    # Page header
     st.markdown("""
     <div style="display:flex;justify-content:space-between;align-items:center;
                 border-bottom:1px solid #1e3040;padding-bottom:10px;margin-bottom:14px;">
@@ -1079,22 +1071,46 @@ def render():
       </div>
     </div>""", unsafe_allow_html=True)
 
-    # Guard: need option chain
     if oc_df is None or (isinstance(oc_df, pd.DataFrame) and oc_df.empty) or not spot:
         st.warning("⏳ Load the Option Chain from **Tab 1** first — paper trading needs live data.")
         return
 
-    # ── Live PnL update every render ─────────────────────────────────
-    _update_live_pnl(oc_df)
+    # ── FIX A: Build indexed DataFrame ONCE — reused everywhere ──────────
+    oc_idx = _build_oc_index(oc_df)
+
+    # ── FIX B: Live PnL with the pre-built index ──────────────────────────
+    _update_live_pnl(oc_df, oc_idx=oc_idx)
 
     open_pnl   = sum(t.get("pnl", 0) for t in st.session_state.pt_open_trades)
     closed_pnl = sum(t.get("pnl", 0) for t in st.session_state.pt_closed_trades)
 
-    # ── Account Header ────────────────────────────────────────────────
     st.markdown(_header_html(st.session_state.pt_account, open_pnl, closed_pnl),
                 unsafe_allow_html=True)
 
-    # ── MAIN LAYOUT: Trade Entry | Open Positions ────────────────────
+    # ── FIX C: Compute signals & technicals ONCE for the whole render ─────
+    # Old: computed inside left_col block, then implicitly needed again by
+    #      _render_trade_suggest_section. Now computed once up-front.
+    try:
+        bull_s, bear_s, pcr_v, pcr_chg, res_s, sup_s, _ = compute_signal_score(
+            oc_df, spot, sel_idx)
+        tech_df, tech_sum = compute_technicals(
+            fetch_intraday_candles(sel_idx, "5minute"))
+        market_flow = (
+            "Bullish" if bull_s - bear_s >= 5
+            else "Bearish" if bear_s - bull_s >= 5
+            else "Range" if abs(bull_s - bear_s) <= 3
+            else "Choppy"
+        )
+    except Exception:
+        bull_s, bear_s, pcr_v, market_flow = 10, 10, 1.0, "Range"
+        tech_sum = {}
+
+    signal_scores = {"bull": bull_s, "bear": bear_s, "pcr": pcr_v, "flow": market_flow}
+
+    # ── FIX C: Compute performance ONCE — passed to all consumers ─────────
+    perf = _calc_performance()
+
+    # ── MAIN LAYOUT ───────────────────────────────────────────────────────
     left_col, right_col = st.columns([1.1, 1.9], gap="medium")
 
     # ══════════════════════════════════════════════════════
@@ -1106,7 +1122,6 @@ def render():
         atm = get_atm_strike(spot, sel_idx)
         strikes = sorted(oc_df["Strike"].unique().tolist())
 
-        # Strike selector with ATM highlighted
         try:
             atm_idx_entry = strikes.index(atm)
         except ValueError:
@@ -1127,12 +1142,10 @@ def render():
             "Lots", min_value=1, max_value=50, value=1, step=1, key="pt_lots"
         )
 
-        # Live preview
-        col_ltp = f"{opt_type}_LTP"
-        row_sel = oc_df[oc_df["Strike"] == strike_sel]
-        ltp_now = round(float(row_sel[col_ltp].values[0]), 2) if not row_sel.empty else 0.0
-        lot_sz  = get_lot_size(sel_idx)
-        qty_tot = lots_sel * lot_sz
+        # FIX A: O(1) LTP lookup
+        ltp_now    = _ltp_from_index(oc_idx, strike_sel, opt_type)
+        lot_sz     = get_lot_size(sel_idx)
+        qty_tot    = lots_sel * lot_sz
         margin_est = _estimate_margin(action, ltp_now, strike_sel, lots_sel, lot_sz)
         max_risk   = ltp_now * qty_tot if action == "BUY" else ltp_now * qty_tot * 3
 
@@ -1154,47 +1167,25 @@ def render():
           {'<div style="margin-top:6px;font-family:Barlow Condensed,sans-serif;font-size:11px;color:#ffd600;letter-spacing:1px;">★ ATM STRIKE</div>' if strike_sel == atm else ''}
         </div>""", unsafe_allow_html=True)
 
-        # SL / Target
         col_sl, col_tgt = st.columns(2)
         with col_sl:
             sl_pts  = st.number_input("SL (pts)", value=15, min_value=1, max_value=200, key="pt_sl")
         with col_tgt:
             tgt_pts = st.number_input("Target (pts)", value=30, min_value=1, max_value=500, key="pt_tgt")
 
-        rr = tgt_pts / max(sl_pts, 1)
+        rr   = tgt_pts / max(sl_pts, 1)
         rr_c = "#00e676" if rr >= 2 else "#ffd600" if rr >= 1.5 else "#ff3d57"
         st.markdown(f"""<div style="text-align:center;font-family:'Barlow Condensed',sans-serif;
             font-size:14px;font-weight:700;color:{rr_c};letter-spacing:1px;margin:4px 0;">
             R:R = 1:{rr:.1f}</div>""", unsafe_allow_html=True)
 
-        # Custom reason
         custom_reason = st.text_area(
             "Trade Reason (optional — will be included in AI analysis)",
             placeholder="e.g. VWAP reclaim after SSL sweep, expecting CE unwinding...",
             height=60, key="pt_reason"
         )
 
-        # Get signal context
-        try:
-            bull_s, bear_s, pcr_v, pcr_chg, res_s, sup_s, _ = compute_signal_score(
-                oc_df, spot, sel_idx)
-            tech_df, tech_sum = compute_technicals(
-                fetch_intraday_candles(sel_idx, "5minute"))
-            market_flow = (
-                "Bullish" if bull_s - bear_s >= 5
-                else "Bearish" if bear_s - bull_s >= 5
-                else "Range" if abs(bull_s - bear_s) <= 3
-                else "Choppy"
-            )
-        except Exception:
-            bull_s, bear_s, pcr_v, market_flow = 10, 10, 1.0, "Range"
-            tech_sum = {}
-
-        signal_scores = {
-            "bull": bull_s, "bear": bear_s, "pcr": pcr_v, "flow": market_flow
-        }
-
-        # Signal context display
+        # Signal context display (uses pre-computed signals)
         flow_c = {"Bullish": "#00e676", "Bearish": "#ff3d57",
                   "Range": "#ffd600", "Choppy": "#7fa8c8"}.get(market_flow, "#7fa8c8")
         st.markdown(f"""
@@ -1209,22 +1200,20 @@ def render():
           <span style="color:#7fa8c8;">{tech_sum.get('ema_trend','')}</span>
         </div>""", unsafe_allow_html=True)
 
-        # EXECUTE button
         mkt_label = "EXECUTE PAPER TRADE" if MARKET_OPEN else "SIMULATE (MKT CLOSED)"
         if st.button(f"🚀 {mkt_label}", use_container_width=True, type="primary", key="pt_exec"):
             new_trade = _execute_paper_trade(
                 oc_df, spot, sel_idx, expiry,
                 strike_sel, opt_type, action, lots_sel,
                 sl_pts, tgt_pts,
-                tech_sum, signal_scores, custom_reason
+                tech_sum, signal_scores, custom_reason,
+                oc_idx=oc_idx,      # FIX A: pass pre-built index
             )
             if new_trade:
                 st.success(f"✅ #{new_trade['id']} executed — {action} {opt_type} {int(strike_sel)} @ ₹{ltp_now}")
                 st.rerun()
 
         st.markdown("---")
-
-        # ── Quick Template Buttons ────────────────────────────────
         section_header("⚡ Quick Templates")
         step_series = oc_df["Strike"].diff().dropna()
         step = int(step_series.mode()[0]) if not step_series.empty else 50
@@ -1240,7 +1229,6 @@ def render():
             with col:
                 if st.button(tname, key=f"tmpl_{tname}", use_container_width=True):
                     for leg_action, leg_type, leg_strike, leg_sl, leg_tgt in legs:
-                        # Validate strike exists
                         if leg_strike not in strikes:
                             continue
                         _execute_paper_trade(
@@ -1248,11 +1236,11 @@ def render():
                             leg_strike, leg_type, leg_action, 1,
                             leg_sl, leg_tgt,
                             tech_sum, signal_scores,
-                            f"Template: {tname.replace(chr(10),' ')}"
+                            f"Template: {tname.replace(chr(10),' ')}",
+                            oc_idx=oc_idx,
                         )
                     st.rerun()
 
-        # ── Account controls ──────────────────────────────────────
         st.markdown("---")
         with st.expander("⚙️ ACCOUNT SETTINGS"):
             new_cap = st.number_input(
@@ -1263,7 +1251,7 @@ def render():
                 diff = new_cap - st.session_state.pt_account["capital"]
                 st.session_state.pt_account["capital"]   = new_cap
                 st.session_state.pt_account["available"] += diff
-                st.session_state.pt_account["peak"]       = max(
+                st.session_state.pt_account["peak"] = max(
                     st.session_state.pt_account["peak"],
                     st.session_state.pt_account["available"]
                 )
@@ -1299,8 +1287,6 @@ def render():
     # RIGHT — OPEN POSITIONS + ANALYTICS
     # ══════════════════════════════════════════════════════
     with right_col:
-
-        # ── Open Positions ────────────────────────────────────────
         open_trades = st.session_state.pt_open_trades
         section_header(
             f"📂 Open Positions  ({len(open_trades)})",
@@ -1317,14 +1303,12 @@ def render():
         else:
             for trade in open_trades:
                 st.markdown(_trade_card_html(trade), unsafe_allow_html=True)
-                # Close + AI buttons per row
                 close_col, ai_col, _ = st.columns([1, 1.5, 3])
                 with close_col:
                     if st.button(f"✕ Close #{trade['id']}", key=f"close_{trade['id']}"):
-                        _close_trade(trade["id"], oc_df, "MANUAL")
+                        _close_trade(trade["id"], oc_df, "MANUAL", oc_idx=oc_idx)
                         st.rerun()
                 with ai_col:
-                    ai_key = f"aishow_{trade['id']}"
                     if st.button(f"🧠 AI Reasoning #{trade['id']}", key=f"ai_btn_{trade['id']}"):
                         with st.spinner("Generating AI analysis…"):
                             reasoning = _generate_ai_reasoning(trade, oc_df, tech_sum, spot)
@@ -1335,7 +1319,6 @@ def render():
                         with st.expander(f"📖 AI Journal #{trade['id']}", expanded=False):
                             st.markdown(trade["ai_reasoning"])
 
-        # ── Closed Trades ──────────────────────────────────────────
         st.markdown("---")
         closed_trades = st.session_state.pt_closed_trades
         section_header(
@@ -1347,7 +1330,7 @@ def render():
                 font-size:12px;letter-spacing:1px;padding:8px;">NO CLOSED TRADES YET</div>""",
                 unsafe_allow_html=True)
         else:
-            for t in closed_trades[::-1][:15]:      # last 15 closed
+            for t in closed_trades[::-1][:15]:
                 st.markdown(_closed_card_html(t), unsafe_allow_html=True)
                 if t.get("ai_reasoning"):
                     with st.expander(f"📖 AI Journal #{t['id']} — {t.get('exit_reason','')}", expanded=False):
@@ -1362,7 +1345,9 @@ def render():
     # TRADE SUGGEST ENGINE
     # ══════════════════════════════════════════════════════
     _render_trade_suggest_section(
-        oc_df, spot, sel_idx, expiry, tech_sum, signal_scores
+        oc_df, spot, sel_idx, expiry, tech_sum, signal_scores,
+        perf=perf,          # FIX C: pass pre-computed perf
+        oc_idx=oc_idx,      # FIX A: pass pre-built index
     )
 
     # ══════════════════════════════════════════════════════
@@ -1372,10 +1357,8 @@ def render():
     section_header("📊 Performance Analytics",
                    "Equity curve · Win stats · P&L distribution · Trade journal")
 
-    perf = _calc_performance()
-
+    # FIX C: reuse already-computed perf — no third call
     if perf:
-        # KPI metrics row
         pnl_c_a = "#00e676" if perf.get("total_pnl", 0) >= 0 else "#ff3d57"
         ret_c   = "#00e676" if perf.get("return_pct", 0) >= 0 else "#ff3d57"
         wr_c    = "#00e676" if perf.get("win_rate", 0) >= 55 else "#ffd600" if perf.get("win_rate", 0) >= 45 else "#ff3d57"
@@ -1392,11 +1375,9 @@ def render():
             metric_card("PROFIT FACTOR",f"{perf['profit_factor']:.2f}", "gross win/loss", pf_c) +
             metric_card("MAX DRAWDOWN", f"{perf['max_drawdown']:.1f}%", "from peak", dd_c_a)
         )
-
     else:
         st.caption("📊 Analytics appear after your first closed trade.")
 
-    # Charts row
     chart_a, chart_b = st.columns(2)
     with chart_a:
         section_header("Equity Curve")
@@ -1510,7 +1491,6 @@ def render():
                       {f'<div style="margin-top:10px;padding:8px;background:#111920;border-radius:2px;color:#ff8c00;font-size:11px;font-family:Barlow,sans-serif;"><b>📝 Trader Note:</b> {t["custom_reason"]}</div>' if t.get("custom_reason") else ""}
                     </div>""", unsafe_allow_html=True)
 
-                # AI reasoning section
                 st.markdown("<div style='margin-top:8px;'></div>", unsafe_allow_html=True)
                 if t.get("ai_reasoning"):
                     st.markdown(t["ai_reasoning"])
