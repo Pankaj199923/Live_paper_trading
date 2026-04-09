@@ -1,12 +1,33 @@
+"""
+tab9_chart.py  —  Live Chart · Order Flow · FVG Auto-Trade Engine
+═══════════════════════════════════════════════════════════════════════════════
+FVG AUTO-TRADE LOGIC
+─────────────────────
+Min FVG size : 10 pts  (configurable in UI)
+
+BEARISH FVG (resistance zone)
+  Trigger : last candle close > fvg_top
+  Trade   : SELL PE ATM  (bullish continuation play)
+
+BULLISH FVG (support zone)
+  Trigger : last candle close < fvg_bot
+  Trade   : SELL CE ATM  (bearish continuation play)
+
+Duplicate guard : one alert per zone per session.
+═══════════════════════════════════════════════════════════════════════════════
+"""
+
+from __future__ import annotations
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import plotly.express as px
 from plotly.subplots import make_subplots
-from datetime import datetime, timedelta
-from config import (TF_OPTIONS, TF_RESAMPLE, ACCESS_TOKEN, IST, now_ist, now_ist_dt, MARKET_OPEN,
-                    df_indices, INDEX_SHORT, LOT_SIZES,
+from datetime import datetime
+
+from config import (TF_OPTIONS, TF_RESAMPLE, ACCESS_TOKEN, IST, now_ist, now_ist_dt,
+                    MARKET_OPEN, df_indices, INDEX_SHORT, LOT_SIZES,
                     BASE_DIR, TRADE_FILE, TODAY_TRADES_FILE, CLOSED_POS_FILE,
                     AI_LOG_FILE, SNAPSHOT_DIR, instrument_df)
 from utils import (load_csv_safe, load_csv_as_list, save_list_to_csv,
@@ -17,14 +38,29 @@ from utils import (load_csv_safe, load_csv_as_list, save_list_to_csv,
                    section_header, metric_card, metrics_row, flow_badge, score_bar)
 from api import fetch_ltp, fetch_available_expiries, fetch_option_chain, fetch_intraday_candles
 from analytics import (bs_price, bs_greeks, implied_vol_newton, calculate_gamma_bs,
-                       compute_signal_score, generate_ai_trade, check_alerts, call_claude_trade_setup)
+                       compute_signal_score, generate_ai_trade, check_alerts,
+                       call_claude_trade_setup)
 from chart_utils import (compute_technicals, compute_order_flow, detect_liquidity_sweeps,
-                         detect_order_blocks, detect_fvg, detect_bos_choch, get_order_flow_summary)
+                          detect_order_blocks, detect_fvg, detect_bos_choch,
+                          get_order_flow_summary)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FIX 9 ▸ Cache multi-TF fetch — prevents re-fetching every Streamlit rerun
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# CONSTANTS
+# ═════════════════════════════════════════════════════════════════════════════
+FVG_MIN_SIZE_DEFAULT = 10    # minimum FVG pts to qualify
+ATM_STEP_DEFAULT     = 50    # Nifty = 50, BankNifty = 100
+MAX_TRADE_LOG        = 50
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _atm(spot: float, step: int = ATM_STEP_DEFAULT) -> int:
+    return int(round(spot / step) * step)
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def _fetch_tf_signal(idx_key: str, tf_api: str):
     """Cached per-TF signal fetch. Refreshes every 60 s."""
@@ -35,13 +71,429 @@ def _fetch_tf_signal(idx_key: str, tf_api: str):
         return {}
 
 
-# ======================================================
-# TAB 9 — LIVE CHART · ORDER FLOW
-# ======================================================
+# ═════════════════════════════════════════════════════════════════════════════
+# FVG AUTO-TRADE ENGINE
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _scan_fvg_triggers(
+    bull_fvgs: list,
+    bear_fvgs: list,
+    last_close: float,
+    spot: float,
+    triggered_ids: set,
+    min_size: float,
+    atm_step: int,
+) -> list:
+    """
+    Scan all qualifying FVG zones against last candle close.
+    Returns list of new signal dicts (empty if nothing triggered).
+    """
+    signals = []
+    now_str = datetime.now().strftime("%H:%M:%S")
+    strike  = _atm(spot, atm_step)
+
+    # ── BEARISH FVG  →  close above top  →  SELL PE ─────────────────────
+    for fg in bear_fvgs:
+        size    = fg["top"] - fg["bot"]
+        if size < min_size:
+            continue
+        zone_id = f"BEAR_{fg['bot']:.0f}_{fg['top']:.0f}"
+        if zone_id in triggered_ids:
+            continue
+        if last_close > fg["top"]:
+            signals.append({
+                "zone_id"  : zone_id,
+                "fvg_type" : "BEAR",
+                "bot"      : fg["bot"],
+                "top"      : fg["top"],
+                "size"     : round(size, 1),
+                "trigger"  : last_close,
+                "action"   : "SELL_PE",
+                "strike"   : strike,
+                "reason"   : (
+                    f"Close {last_close:,.1f} > Bearish FVG top {fg['top']:,.1f} "
+                    f"→ resistance broken → BULLISH bias → SELL PE {strike}"
+                ),
+                "time"     : now_str,
+            })
+
+    # ── BULLISH FVG  →  close below bot  →  SELL CE ─────────────────────
+    for fg in bull_fvgs:
+        size    = fg["top"] - fg["bot"]
+        if size < min_size:
+            continue
+        zone_id = f"BULL_{fg['bot']:.0f}_{fg['top']:.0f}"
+        if zone_id in triggered_ids:
+            continue
+        if last_close < fg["bot"]:
+            signals.append({
+                "zone_id"  : zone_id,
+                "fvg_type" : "BULL",
+                "bot"      : fg["bot"],
+                "top"      : fg["top"],
+                "size"     : round(size, 1),
+                "trigger"  : last_close,
+                "action"   : "SELL_CE",
+                "strike"   : strike,
+                "reason"   : (
+                    f"Close {last_close:,.1f} < Bullish FVG bot {fg['bot']:,.1f} "
+                    f"→ support broken → BEARISH bias → SELL CE {strike}"
+                ),
+                "time"     : now_str,
+            })
+
+    return signals
+
+
+def _render_fvg_auto_trade(
+    bull_fvgs   : list,
+    bear_fvgs   : list,
+    of_df9      : pd.DataFrame,
+    spot        : float,
+    index_key   : str,
+    expiry      : str,
+    place_order_fn = None,   # callable(action, strike, index_key) -> bool  or None
+):
+    """Full FVG Auto-Trade UI panel."""
+
+    # ── Session state ────────────────────────────────────────────────────
+    for _k, _v in [
+        ("fvg_triggered_ids", set()),
+        ("fvg_trade_log",     []),
+        ("fvg_auto_enabled",  False),
+    ]:
+        if _k not in st.session_state:
+            st.session_state[_k] = _v
+
+    trig_ids  = st.session_state["fvg_triggered_ids"]
+    trade_log = st.session_state["fvg_trade_log"]
+
+    last_close = float(of_df9["close"].iloc[-1]) if not of_df9.empty else spot
+
+    # ── Panel header ─────────────────────────────────────────────────────
+    st.markdown("""
+    <div style="background:#0d1117;border:1px solid #ffd600;border-left:4px solid #ffd600;
+                border-radius:4px;padding:12px 18px;margin:10px 0 14px 0;">
+      <div style="font-family:'Barlow Condensed',sans-serif;font-size:17px;font-weight:700;
+                  letter-spacing:2px;color:#ffd600;">⚡ FVG AUTO-TRADE ENGINE</div>
+      <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#3a6080;
+                  margin-top:3px;">
+        Fair Value Gap imbalance triggers · Bearish FVG → SELL PE · Bullish FVG → SELL CE
+      </div>
+    </div>""", unsafe_allow_html=True)
+
+    # ── Controls ─────────────────────────────────────────────────────────
+    _cc1, _cc2, _cc3, _cc4 = st.columns([2, 2, 2, 4])
+    with _cc1:
+        auto_on = st.toggle(
+            "🤖 AUTO TRADE",
+            value=st.session_state["fvg_auto_enabled"],
+            key="fvg_auto_toggle",
+            help="Fires place_order_fn() automatically on each new FVG signal",
+        )
+        st.session_state["fvg_auto_enabled"] = auto_on
+    with _cc2:
+        min_size = st.number_input(
+            "Min FVG pts", min_value=5, max_value=200,
+            value=FVG_MIN_SIZE_DEFAULT, step=5, key="fvg_min_size",
+        )
+    with _cc3:
+        atm_step = st.number_input(
+            "Strike step", min_value=10, max_value=200,
+            value=ATM_STEP_DEFAULT, step=10, key="fvg_atm_step",
+            help="50 for Nifty, 100 for BankNifty",
+        )
+    with _cc4:
+        st.markdown(f"""
+        <div style="background:#070b0f;border:1px solid #1e3040;border-radius:3px;
+                    padding:8px 14px;margin-top:4px;display:flex;gap:20px;align-items:center;">
+          <div>
+            <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;
+                        letter-spacing:1.5px;color:#3a6080;">LAST CLOSE</div>
+            <div style="font-family:'JetBrains Mono',monospace;font-size:16px;
+                        font-weight:700;color:#e8f4ff;">{last_close:,.1f}</div>
+          </div>
+          <div>
+            <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;
+                        letter-spacing:1.5px;color:#3a6080;">SPOT</div>
+            <div style="font-family:'JetBrains Mono',monospace;font-size:16px;
+                        font-weight:700;color:#ff8c00;">{spot:,.1f}</div>
+          </div>
+          <div>
+            <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;
+                        letter-spacing:1.5px;color:#3a6080;">ATM STRIKE</div>
+            <div style="font-family:'JetBrains Mono',monospace;font-size:16px;
+                        font-weight:700;color:#00d4ff;">{_atm(spot, atm_step):,}</div>
+          </div>
+          <div>
+            <div style="font-family:'Barlow Condensed',sans-serif;font-size:9px;
+                        letter-spacing:1.5px;color:#3a6080;">AUTO</div>
+            <div style="font-family:'JetBrains Mono',monospace;font-size:14px;
+                        font-weight:700;color:{'#00e676' if auto_on else '#ff3d57'};">
+                {'ON ✅' if auto_on else 'OFF ⛔'}</div>
+          </div>
+        </div>""", unsafe_allow_html=True)
+
+    # ── FVG Zone Cards ────────────────────────────────────────────────────
+    _qual_bear = [f for f in bear_fvgs if (f["top"] - f["bot"]) >= min_size]
+    _qual_bull = [f for f in bull_fvgs if (f["top"] - f["bot"]) >= min_size]
+
+    st.markdown(
+        f'<div style="font-family:\'Barlow Condensed\',sans-serif;font-size:10px;'
+        f'letter-spacing:1.5px;color:#3a6080;margin:12px 0 6px 0;">'
+        f'QUALIFYING FVG ZONES  (≥ {min_size} pts)  —  '
+        f'{len(_qual_bear)} bearish  ·  {len(_qual_bull)} bullish</div>',
+        unsafe_allow_html=True,
+    )
+
+    _fz1, _fz2 = st.columns(2)
+
+    with _fz1:
+        st.markdown(
+            '<div style="font-family:\'Barlow Condensed\',sans-serif;font-size:11px;'
+            'color:#ff3d57;letter-spacing:1px;margin-bottom:5px;">'
+            '🔴 BEARISH FVG  →  SELL PE  when close &gt; top</div>',
+            unsafe_allow_html=True,
+        )
+        if _qual_bear:
+            for _fg in _qual_bear[::-1]:
+                _sz   = _fg["top"] - _fg["bot"]
+                _hit  = last_close > _fg["top"]
+                _zid  = f"BEAR_{_fg['bot']:.0f}_{_fg['top']:.0f}"
+                _done = _zid in trig_ids
+                _bdr  = "#ffd600" if (_hit and not _done) else ("#555" if _done else "#ff3d57")
+                _bg   = "#1a1200" if (_hit and not _done) else "#0d0303"
+                _tag  = "⚡ LIVE TRIGGER" if (_hit and not _done) else ("✅ FIRED" if _done else "")
+                _tclr = "#ffd600" if (_hit and not _done) else "#3a6080"
+                st.markdown(f"""
+                <div style="background:{_bg};border:1px solid {_bdr};border-radius:3px;
+                    padding:7px 12px;margin:3px 0;">
+                  <div style="display:flex;justify-content:space-between;align-items:center;">
+                    <span style="font-family:'JetBrains Mono',monospace;font-size:13px;
+                                 font-weight:700;color:#ff3d57;">
+                      {_fg['bot']:,.0f} — {_fg['top']:,.0f}</span>
+                    <span style="font-family:'Barlow Condensed',sans-serif;font-size:10px;
+                                 font-weight:700;color:{_tclr};">{_tag}</span>
+                  </div>
+                  <div style="font-family:'JetBrains Mono',monospace;font-size:9px;
+                              color:#3a6080;margin-top:3px;">
+                    size: {_sz:.1f} pts  |  {str(_fg.get('time',''))[-8:]}
+                    |  trigger: close &gt; {_fg['top']:,.0f}  →  SELL PE {_atm(spot, atm_step)}
+                  </div>
+                </div>""", unsafe_allow_html=True)
+        else:
+            st.markdown(
+                "<div style='color:#3a6080;font-size:11px;font-family:JetBrains Mono,monospace;"
+                "padding:8px;border:1px dashed #1e3040;border-radius:3px;'>"
+                "No qualifying bearish FVGs (min " + str(min_size) + " pts)</div>",
+                unsafe_allow_html=True,
+            )
+
+    with _fz2:
+        st.markdown(
+            '<div style="font-family:\'Barlow Condensed\',sans-serif;font-size:11px;'
+            'color:#00e676;letter-spacing:1px;margin-bottom:5px;">'
+            '🟢 BULLISH FVG  →  SELL CE  when close &lt; bot</div>',
+            unsafe_allow_html=True,
+        )
+        if _qual_bull:
+            for _fg in _qual_bull[::-1]:
+                _sz   = _fg["top"] - _fg["bot"]
+                _hit  = last_close < _fg["bot"]
+                _zid  = f"BULL_{_fg['bot']:.0f}_{_fg['top']:.0f}"
+                _done = _zid in trig_ids
+                _bdr  = "#ffd600" if (_hit and not _done) else ("#555" if _done else "#00e676")
+                _bg   = "#1a1200" if (_hit and not _done) else "#01100a"
+                _tag  = "⚡ LIVE TRIGGER" if (_hit and not _done) else ("✅ FIRED" if _done else "")
+                _tclr = "#ffd600" if (_hit and not _done) else "#3a6080"
+                st.markdown(f"""
+                <div style="background:{_bg};border:1px solid {_bdr};border-radius:3px;
+                    padding:7px 12px;margin:3px 0;">
+                  <div style="display:flex;justify-content:space-between;align-items:center;">
+                    <span style="font-family:'JetBrains Mono',monospace;font-size:13px;
+                                 font-weight:700;color:#00e676;">
+                      {_fg['bot']:,.0f} — {_fg['top']:,.0f}</span>
+                    <span style="font-family:'Barlow Condensed',sans-serif;font-size:10px;
+                                 font-weight:700;color:{_tclr};">{_tag}</span>
+                  </div>
+                  <div style="font-family:'JetBrains Mono',monospace;font-size:9px;
+                              color:#3a6080;margin-top:3px;">
+                    size: {_sz:.1f} pts  |  {str(_fg.get('time',''))[-8:]}
+                    |  trigger: close &lt; {_fg['bot']:,.0f}  →  SELL CE {_atm(spot, atm_step)}
+                  </div>
+                </div>""", unsafe_allow_html=True)
+        else:
+            st.markdown(
+                "<div style='color:#3a6080;font-size:11px;font-family:JetBrains Mono,monospace;"
+                "padding:8px;border:1px dashed #1e3040;border-radius:3px;'>"
+                "No qualifying bullish FVGs (min " + str(min_size) + " pts)</div>",
+                unsafe_allow_html=True,
+            )
+
+    # ── Signal scan + fire ────────────────────────────────────────────────
+    new_signals = _scan_fvg_triggers(
+        bull_fvgs   = _qual_bull,
+        bear_fvgs   = _qual_bear,
+        last_close  = last_close,
+        spot        = spot,
+        triggered_ids = trig_ids,
+        min_size    = min_size,
+        atm_step    = atm_step,
+    )
+
+    for sig in new_signals:
+        trig_ids.add(sig["zone_id"])
+        log_entry = {**sig, "index": index_key, "expiry": expiry, "auto": auto_on}
+
+        # Auto-place order
+        order_placed = False
+        if auto_on and place_order_fn is not None:
+            try:
+                order_placed = place_order_fn(sig["action"], sig["strike"], index_key)
+                log_entry["order_placed"] = order_placed
+            except Exception as _oe:
+                log_entry["order_error"] = str(_oe)
+
+        trade_log.insert(0, log_entry)
+        if len(trade_log) > MAX_TRADE_LOG:
+            trade_log.pop()
+
+        # Flash alert card
+        _ac   = sig["action"]
+        _clr  = "#ffd600" if _ac == "SELL_PE" else "#c084fc"
+        _bg   = "#1a1500" if _ac == "SELL_PE" else "#100010"
+        _lbl  = f"🟡 SELL PE {sig['strike']}  (short put)" if _ac == "SELL_PE" \
+                else f"🟣 SELL CE {sig['strike']}  (short call)"
+        _otag = ""
+        if auto_on:
+            _otag = (
+                '<span style="color:#00e676;font-size:11px;">✅ ORDER PLACED</span>'
+                if order_placed
+                else '<span style="color:#ff3d57;font-size:11px;">⚠ MANUAL NEEDED</span>'
+            )
+        st.markdown(f"""
+        <div style="background:{_bg};border:2px solid {_clr};border-radius:5px;
+                    padding:14px 18px;margin:10px 0;">
+          <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:6px;">
+            <span style="font-family:'Barlow Condensed',sans-serif;font-size:20px;
+                         font-weight:700;color:{_clr};letter-spacing:3px;">⚡ FVG SIGNAL</span>
+            <span style="font-family:'JetBrains Mono',monospace;font-size:15px;
+                         font-weight:700;color:#e8f4ff;">{_lbl}</span>
+            {_otag}
+          </div>
+          <div style="font-family:'JetBrains Mono',monospace;font-size:11px;
+                      color:#7fa8c8;">{sig['reason']}</div>
+          <div style="font-family:'Barlow Condensed',sans-serif;font-size:10px;
+                      color:#3a6080;margin-top:5px;">
+            FVG: {sig['bot']:,.0f}–{sig['top']:,.0f}  ({sig['size']} pts)  |  
+            {'Bearish FVG broken upward' if sig['fvg_type']=='BEAR' else 'Bullish FVG broken downward'}  |  
+            {sig['time']}
+          </div>
+        </div>""", unsafe_allow_html=True)
+
+    # ── Manual trade buttons (when AUTO is OFF) ───────────────────────────
+    if not auto_on:
+        st.markdown(
+            '<div style="font-family:\'Barlow Condensed\',sans-serif;font-size:10px;'
+            'letter-spacing:1.5px;color:#3a6080;margin:10px 0 4px 0;">'
+            'MANUAL OVERRIDE  (Auto OFF)</div>',
+            unsafe_allow_html=True,
+        )
+        _mb1, _mb2, _mb3 = st.columns([2, 2, 6])
+        with _mb1:
+            if st.button(
+                f"🟡 SELL PE {_atm(spot, atm_step)}",
+                key="fvg_manual_pe_btn",
+                type="primary",
+                use_container_width=True,
+            ):
+                _me = {
+                    "zone_id": "MANUAL_PE", "fvg_type": "MANUAL",
+                    "action": "SELL_PE", "strike": _atm(spot, atm_step),
+                    "trigger": last_close, "bot": 0, "top": 0, "size": 0,
+                    "reason": "Manual PE sell",
+                    "time": datetime.now().strftime("%H:%M:%S"),
+                    "index": index_key, "expiry": expiry, "auto": False,
+                }
+                trade_log.insert(0, _me)
+                if place_order_fn:
+                    place_order_fn("SELL_PE", _atm(spot, atm_step), index_key)
+                st.success(f"✅ SELL PE {_atm(spot, atm_step)} sent")
+        with _mb2:
+            if st.button(
+                f"🟣 SELL CE {_atm(spot, atm_step)}",
+                key="fvg_manual_ce_btn",
+                use_container_width=True,
+            ):
+                _me = {
+                    "zone_id": "MANUAL_CE", "fvg_type": "MANUAL",
+                    "action": "SELL_CE", "strike": _atm(spot, atm_step),
+                    "trigger": last_close, "bot": 0, "top": 0, "size": 0,
+                    "reason": "Manual CE sell",
+                    "time": datetime.now().strftime("%H:%M:%S"),
+                    "index": index_key, "expiry": expiry, "auto": False,
+                }
+                trade_log.insert(0, _me)
+                if place_order_fn:
+                    place_order_fn("SELL_CE", _atm(spot, atm_step), index_key)
+                st.success(f"✅ SELL CE {_atm(spot, atm_step)} sent")
+
+    # ── Reset button ──────────────────────────────────────────────────────
+    _rc1, _rc2 = st.columns([2, 8])
+    with _rc1:
+        if st.button("🔄 Reset Zone Memory", key="fvg_reset_zones", use_container_width=True):
+            st.session_state["fvg_triggered_ids"] = set()
+            st.success("All FVG zones re-armed ✅")
+
+    # ── Trade Alert Log ───────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown(
+        '<div style="font-family:\'Barlow Condensed\',sans-serif;font-size:11px;'
+        'letter-spacing:2px;color:#7fa8c8;margin:8px 0 6px 0;">📋 FVG TRADE LOG</div>',
+        unsafe_allow_html=True,
+    )
+    if trade_log:
+        for _tl in trade_log[:15]:
+            _ac   = _tl["action"]
+            _clr  = "#ffd600" if _ac == "SELL_PE" else "#c084fc"
+            _lbl  = f"SELL PE {_tl['strike']}" if _ac == "SELL_PE" else f"SELL CE {_tl['strike']}"
+            _fi   = (f"{_tl['bot']:,.0f}–{_tl['top']:,.0f} ({_tl['size']} pts)"
+                     if _tl["bot"] else "MANUAL")
+            _atag = "🤖" if _tl.get("auto") else "👆"
+            _pt   = "✅" if _tl.get("order_placed") else ""
+            st.markdown(f"""
+            <div style="background:#070b0f;border:1px solid #1e3040;
+                border-left:3px solid {_clr};border-radius:2px;
+                padding:6px 12px;margin:2px 0;
+                font-family:'JetBrains Mono',monospace;">
+              <div style="display:flex;justify-content:space-between;align-items:center;">
+                <span style="color:{_clr};font-weight:700;font-size:12px;">{_lbl}</span>
+                <span style="color:#3a6080;font-size:10px;">
+                  {_tl['time']}  {_atag}  {_pt}</span>
+              </div>
+              <div style="color:#7fa8c8;font-size:10px;margin-top:2px;">
+                FVG: {_fi}  |  close @ {_tl['trigger']:,.1f}  |  
+                {_tl.get('index','')} {_tl.get('expiry','')}
+              </div>
+            </div>""", unsafe_allow_html=True)
+    else:
+        st.markdown(
+            "<div style='color:#3a6080;font-size:11px;font-family:JetBrains Mono,monospace;"
+            "padding:10px;'>No FVG trades triggered yet this session.</div>",
+            unsafe_allow_html=True,
+        )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 9 — MAIN RENDER
+# ═════════════════════════════════════════════════════════════════════════════
+
 def render():
     st.session_state["active_tab_key"] = "📊 CHART"
-    section_header("Live Chart  ·  Order Flow  ·  Liquidity Sweep",
-                   "1m–1H  ·  Delta  ·  Cum Delta  ·  Sweeps  ·  Order Blocks  ·  FVG  ·  BOS/CHoCH")
+    section_header(
+        "Live Chart  ·  Order Flow  ·  Liquidity Sweep  ·  FVG Auto-Trade",
+        "1m–1H  ·  Delta  ·  Cum Delta  ·  Sweeps  ·  Order Blocks  ·  FVG  ·  BOS/CHoCH",
+    )
 
     oc_t9   = st.session_state.get("current_option_chain", pd.DataFrame())
     spot_t9 = st.session_state.get("current_spot_price")
@@ -51,29 +503,20 @@ def render():
         st.warning("⏳ Load option chain from Tab 1 first.")
         return
 
-    # ── S&R levels via max OI strike above/below spot ──────────────────────
-    # FIX 1 ▸ was using min(_r9) / max(_s9) which picks nearest strike, not
-    #          highest-OI strike.  Sort by OI desc, filter, take first element.
+    # ── S&R from max OI ───────────────────────────────────────────────────
     m_res9, m_sup9 = None, None
     if not oc_t9.empty:
         try:
-            # Highest CE OI strike that is ABOVE spot → key resistance
-            _above9 = (
-                oc_t9[oc_t9["Strike"] > spot_t9]
-                .sort_values("CE_OI", ascending=False)
-            )
+            _above9 = (oc_t9[oc_t9["Strike"] > spot_t9]
+                       .sort_values("CE_OI", ascending=False))
             m_res9 = float(_above9["Strike"].iloc[0]) if not _above9.empty else None
-
-            # Highest PE OI strike that is BELOW spot → key support
-            _below9 = (
-                oc_t9[oc_t9["Strike"] < spot_t9]
-                .sort_values("PE_OI", ascending=False)
-            )
+            _below9 = (oc_t9[oc_t9["Strike"] < spot_t9]
+                       .sort_values("PE_OI", ascending=False))
             m_sup9 = float(_below9["Strike"].iloc[0]) if not _below9.empty else None
         except Exception:
             pass
 
-    # ── Timeframe Buttons (visual) + functional selectbox ─────────────────
+    # ── Timeframe selector ────────────────────────────────────────────────
     tf_labels9 = list(TF_OPTIONS.keys())
     if "chart_tf9" not in st.session_state:
         st.session_state.chart_tf9 = "5m"
@@ -104,32 +547,32 @@ def render():
     sel_tf9     = st.session_state.chart_tf9
     sel_tf9_api = TF_OPTIONS[sel_tf9]
 
-    # ── Indicator Toggles ─────────────────────────────────────────────────
+    # ── Indicator toggles ─────────────────────────────────────────────────
     st.markdown(
         '<div style="font-family:\'Barlow Condensed\',sans-serif;font-size:10px;'
         'letter-spacing:1.5px;color:#3a6080;margin-bottom:4px;">INDICATORS</div>',
         unsafe_allow_html=True,
     )
-    ind_c1,ind_c2,ind_c3,ind_c4,ind_c5,ind_c6,ind_c7,ind_c8,ind_c9,ind_c10 = st.columns(10)
-    with ind_c1:  show_ema9   = st.toggle("EMA9",   value=True,  key="ind_ema9")
-    with ind_c2:  show_ema21  = st.toggle("EMA21",  value=True,  key="ind_ema21")
-    with ind_c3:  show_ema50  = st.toggle("EMA50",  value=True,  key="ind_ema50")
-    with ind_c4:  show_vwap   = st.toggle("VWAP",   value=True,  key="ind_vwap")
-    with ind_c5:  show_bb     = st.toggle("BB",     value=True,  key="ind_bb")
-    with ind_c6:  show_sweeps = st.toggle("Sweeps", value=True,  key="ov_sw9")
-    with ind_c7:  show_ob     = st.toggle("OB",     value=True,  key="ov_ob9")
-    with ind_c8:  show_fvg    = st.toggle("FVG",    value=True,  key="ov_fvg9")
-    with ind_c9:  show_bos    = st.toggle("BOS",    value=True,  key="ov_bos9")
-    with ind_c10: show_delta  = st.toggle("Δ Row",  value=True,  key="ov_dl9")
+    _ic = st.columns(10)
+    with _ic[0]:  show_ema9   = st.toggle("EMA9",   value=True,  key="ind_ema9")
+    with _ic[1]:  show_ema21  = st.toggle("EMA21",  value=True,  key="ind_ema21")
+    with _ic[2]:  show_ema50  = st.toggle("EMA50",  value=True,  key="ind_ema50")
+    with _ic[3]:  show_vwap   = st.toggle("VWAP",   value=True,  key="ind_vwap")
+    with _ic[4]:  show_bb     = st.toggle("BB",     value=True,  key="ind_bb")
+    with _ic[5]:  show_sweeps = st.toggle("Sweeps", value=True,  key="ov_sw9")
+    with _ic[6]:  show_ob     = st.toggle("OB",     value=True,  key="ov_ob9")
+    with _ic[7]:  show_fvg    = st.toggle("FVG",    value=True,  key="ov_fvg9")
+    with _ic[8]:  show_bos    = st.toggle("BOS",    value=True,  key="ov_bos9")
+    with _ic[9]:  show_delta  = st.toggle("Δ Row",  value=True,  key="ov_dl9")
 
-    ind_c11, ind_c12, ind_c13, ind_c14 = st.columns([1, 1, 1, 7])
-    with ind_c11: show_eqlev = st.toggle("EqH/L", value=True, key="ov_eq9")
-    with ind_c12: show_rsi   = st.toggle("RSI",   value=True, key="ind_rsi9")
-    with ind_c13: show_macd  = st.toggle("MACD",  value=True, key="ind_macd9")
+    _ic2 = st.columns([1, 1, 1, 7])
+    with _ic2[0]: show_eqlev = st.toggle("EqH/L", value=True, key="ov_eq9")
+    with _ic2[1]: show_rsi   = st.toggle("RSI",   value=True, key="ind_rsi9")
+    with _ic2[2]: show_macd  = st.toggle("MACD",  value=True, key="ind_macd9")
 
-    # ── Fetch candles & compute ───────────────────────────────────────────
-    raw_df9         = fetch_intraday_candles(sel_t9, sel_tf9_api)
-    tech_df9, ts9   = compute_technicals(raw_df9)
+    # ── Fetch & compute ───────────────────────────────────────────────────
+    raw_df9       = fetch_intraday_candles(sel_t9, sel_tf9_api)
+    tech_df9, ts9 = compute_technicals(raw_df9)
 
     if tech_df9.empty:
         st.warning("⏳ No candle data available.")
@@ -138,13 +581,12 @@ def render():
     of_df9  = compute_order_flow(tech_df9)
     of_sum9 = get_order_flow_summary(of_df9)
 
-    # ICT detectors
     sweeps_bsl9, sweeps_ssl9, eq_highs9, eq_lows9 = detect_liquidity_sweeps(of_df9)
     bull_obs9, bear_obs9 = detect_order_blocks(of_df9)
     bull_fvg9, bear_fvg9 = detect_fvg(of_df9)
     bos9, choch9         = detect_bos_choch(of_df9)
 
-    # ── Multi-TF Signal Matrix ─────────────────────────────────────────────
+    # ── Multi-TF signal matrix ────────────────────────────────────────────
     st.markdown(
         '<div style="font-family:\'Barlow Condensed\',sans-serif;font-size:11px;'
         'letter-spacing:2px;color:#7fa8c8;margin:10px 0 6px 0;">⚡ MULTI-TIMEFRAME SIGNAL MATRIX</div>',
@@ -153,30 +595,20 @@ def render():
     _mhtml = '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px;">'
     for _tfl2, _tfa2 in TF_OPTIONS.items():
         try:
-            # FIX 9 ▸ cached fetch — no extra API calls on every rerun
             _ms2 = _fetch_tf_signal(sel_t9, _tfa2)
             if not _ms2:
-                raise ValueError("empty signal")
-
+                raise ValueError("empty")
             _r2 = _ms2.get("rsi14", 50)
             _e2 = _ms2.get("ema_trend", "MIXED")
             _m2 = _ms2.get("macd_cross", "BEARISH")
             _v2 = _ms2.get("price_vs_vwap", "BELOW")
-
-            # FIX 2 ▸ Bullish RSI zone: 40–70 (was 30–65, too tight upper bound)
-            # FIX 3 ▸ Bearish RSI: only >70 overbought; removed `or _r2<30`
-            #          (oversold RSI is a BULLISH signal, not bearish)
-            _b2  = sum([_e2 == "BULLISH", _m2 == "BULLISH",
-                        _v2 == "ABOVE",   40 < _r2 < 70])
-            _br2 = sum([_e2 == "BEARISH", _m2 == "BEARISH",
-                        _v2 == "BELOW",   _r2 > 70])
-
+            _b2  = sum([_e2 == "BULLISH", _m2 == "BULLISH", _v2 == "ABOVE", 40 < _r2 < 70])
+            _br2 = sum([_e2 == "BEARISH", _m2 == "BEARISH", _v2 == "BELOW", _r2 > 70])
             if   _b2  >= 3: _la2, _c2, _i2 = "BULL",  "#00e676", "▲"
             elif _br2 >= 3: _la2, _c2, _i2 = "BEAR",  "#ff3d57", "▼"
             elif _b2  == 2: _la2, _c2, _i2 = "MILD↑", "#7fc97f", "↗"
             elif _br2 == 2: _la2, _c2, _i2 = "MILD↓", "#e06060", "↘"
             else:           _la2, _c2, _i2 = "NEUT",  "#ffd600", "–"
-
             _sb2 = "border-width:2px;" if _tfl2 == sel_tf9 else ""
             _mhtml += (
                 f'<div style="background:#0d1117;border:1px solid {_c2};{_sb2}'
@@ -204,7 +636,7 @@ def render():
     st.markdown(_mhtml, unsafe_allow_html=True)
 
     # ─────────────────────────────────────────────────────────────────────
-    # 📊 ORDER FLOW SUMMARY CARDS
+    # ORDER FLOW DASHBOARD
     # ─────────────────────────────────────────────────────────────────────
     st.markdown("---")
     section_header("Order Flow Dashboard",
@@ -233,7 +665,6 @@ def render():
                     "High Vol Nodes", "#00d4ff")
     )
 
-    # Buy/Sell pressure bar
     st.markdown(f"""
     <div style="background:#0d1117;border:1px solid #1e3040;border-radius:3px;
                 padding:10px 14px;margin-bottom:8px;">
@@ -255,51 +686,39 @@ def render():
       </div>
       <div style="font-family:'JetBrains Mono',monospace;font-size:10px;
                   color:#3a6080;margin-top:4px;">
-        Last 5 candle deltas: {" | ".join([f"{d:+,.0f}" for d in of_sum9.get("last5_delta",[])])}
+        Last 5 deltas: {" | ".join([f"{d:+,.0f}" for d in of_sum9.get("last5_delta",[])])}
       </div>
     </div>""", unsafe_allow_html=True)
 
     # ─────────────────────────────────────────────────────────────────────
-    # 🕯️ MAIN CHART — multi-panel
+    # MAIN CHART
     # ─────────────────────────────────────────────────────────────────────
     st.markdown("---")
     section_header(f"{idx_short(sel_t9)}  [{sel_tf9}]  Candle Chart",
                    "Candlesticks · EMA · VWAP · BB · Sweeps · OB · FVG · BOS/CHoCH")
 
     try:
-        # ── Row / height layout (dynamic based on toggles) ─────────────
         _show_indicator_row = show_rsi or show_macd
-
-        # Base: candle(1) + volume(2)
-        # + cum_delta row if show_delta
-        # + indicator row if show_rsi or show_macd
         _rows = 2
-        if show_delta:
-            _rows += 1
-        if _show_indicator_row:
-            _rows += 1
-
-        # Row index for RSI/MACD panel
+        if show_delta:          _rows += 1
+        if _show_indicator_row: _rows += 1
         _cum_row = 2 + (1 if show_delta else 0) + (1 if _show_indicator_row else 0)
 
-        # Heights must sum to 1.0
-        if show_delta and _show_indicator_row:     # 4 rows
+        if show_delta and _show_indicator_row:
             _heights = [0.52, 0.14, 0.17, 0.17]
-        elif show_delta and not _show_indicator_row:  # 3 rows
+        elif show_delta and not _show_indicator_row:
             _heights = [0.60, 0.18, 0.22]
-        elif not show_delta and _show_indicator_row:  # 3 rows
+        elif not show_delta and _show_indicator_row:
             _heights = [0.58, 0.18, 0.24]
-        else:                                         # 2 rows
+        else:
             _heights = [0.65, 0.35]
 
         _subplot_titles = [
             f"{idx_short(sel_t9)}  [{sel_tf9}]  —  {len(of_df9)} candles",
             "Volume  /  Delta Bars",
         ]
-        if show_delta:
-            _subplot_titles.append("Cumulative Delta")
-        if _show_indicator_row:
-            _subplot_titles.append("RSI(14)  /  MACD Hist")
+        if show_delta:          _subplot_titles.append("Cumulative Delta")
+        if _show_indicator_row: _subplot_titles.append("RSI(14)  /  MACD Hist")
 
         fig9 = make_subplots(
             rows=_rows, cols=1,
@@ -309,7 +728,7 @@ def render():
             subplot_titles=_subplot_titles,
         )
 
-        # ── ROW 1: Candlesticks ────────────────────────────────────────
+        # ── Row 1: Candles ────────────────────────────────────────────
         fig9.add_trace(go.Candlestick(
             x=of_df9["timestamp"],
             open=of_df9["open"], high=of_df9["high"],
@@ -319,8 +738,6 @@ def render():
             name="OHLC", whiskerwidth=0.5,
         ), row=1, col=1)
 
-        # FIX 5 ▸ renamed inner variable from _ce9 → _ec to avoid shadowing
-        #         the outer _ce9 option-chain dataframe
         ema_cfg = [
             (9,  "#ff8c00", "EMA9",  show_ema9),
             (21, "#00d4ff", "EMA21", show_ema21),
@@ -333,7 +750,6 @@ def render():
                     mode="lines", name=_nm, line=dict(color=_ec, width=1.2),
                 ), row=1, col=1)
 
-        # VWAP + ±2σ bands
         if show_vwap and "vwap" in of_df9.columns:
             fig9.add_trace(go.Scatter(
                 x=of_df9["timestamp"], y=of_df9["vwap"],
@@ -356,13 +772,11 @@ def render():
                     showlegend=False,
                 ), row=1, col=1)
 
-        # Bollinger Bands
         if show_bb and "bb_upper" in of_df9.columns:
             fig9.add_trace(go.Scatter(
                 x=of_df9["timestamp"], y=of_df9["bb_upper"],
                 mode="lines", name="BB Upper",
                 line=dict(color="#2a5070", width=0.9, dash="dash"),
-                showlegend=True,
             ), row=1, col=1)
             if "bb_lower" in of_df9.columns:
                 fig9.add_trace(go.Scatter(
@@ -373,7 +787,6 @@ def render():
                     showlegend=False,
                 ), row=1, col=1)
 
-        # Absorption markers (gold diamond, below candle)
         if "absorption" in of_df9.columns:
             _abs9 = of_df9[of_df9["absorption"]]
             if not _abs9.empty:
@@ -384,11 +797,6 @@ def render():
                                 line=dict(color="#000", width=0.5)),
                 ), row=1, col=1)
 
-        # FIX 4 ▸ Divergence markers were COMPLETELY SWAPPED in original code.
-        #   bull_div = price lower low + delta higher low → hidden BUYING → bullish signal
-        #              → triangle-UP below candle, cyan
-        #   bear_div = price higher high + delta lower high → hidden SELLING → bearish signal
-        #              → triangle-DOWN above candle, orange
         if "bull_div" in of_df9.columns:
             _bd9 = of_df9[of_df9["bull_div"]]
             if not _bd9.empty:
@@ -409,16 +817,13 @@ def render():
                                 line=dict(color="#000", width=0.5)),
                 ), row=1, col=1)
 
-        # ── Liquidity Sweep overlays ────────────────────────────────────
+        # Sweeps
         if show_sweeps:
-            # Use showlegend once per type to avoid legend spam
-            _bsl_shown = False
-            _ssl_shown = False
+            _bsl_shown = _ssl_shown = False
             for _sw in sweeps_bsl9:
                 fig9.add_trace(go.Scatter(
                     x=[_sw["time"]], y=[_sw["wick"]],
-                    mode="markers+text",
-                    name="BSL Sweep",
+                    mode="markers+text", name="BSL Sweep",
                     marker=dict(symbol="triangle-down-open", size=14,
                                 color="#ff3d57", line=dict(color="#ff3d57", width=2)),
                     text=["BSL"], textposition="top center",
@@ -429,8 +834,7 @@ def render():
             for _sw in sweeps_ssl9:
                 fig9.add_trace(go.Scatter(
                     x=[_sw["time"]], y=[_sw["wick"]],
-                    mode="markers+text",
-                    name="SSL Sweep",
+                    mode="markers+text", name="SSL Sweep",
                     marker=dict(symbol="triangle-up-open", size=14,
                                 color="#00e676", line=dict(color="#00e676", width=2)),
                     text=["SSL"], textposition="bottom center",
@@ -439,10 +843,9 @@ def render():
                 ), row=1, col=1)
                 _ssl_shown = True
 
-        # ── FVG rectangles ─────────────────────────────────────────────
+        # FVG rectangles
         fvg_shapes9 = []
         if show_fvg and not of_df9.empty:
-            _t_min9 = of_df9["timestamp"].iloc[0]
             _t_max9 = of_df9["timestamp"].iloc[-1]
             for _fg in bull_fvg9:
                 fvg_shapes9.append(dict(
@@ -461,7 +864,7 @@ def render():
                     line=dict(color="#ff3d57", width=0.5, dash="dot"),
                 ))
 
-        # ── Order Block rectangles ──────────────────────────────────────
+        # Order Block rectangles
         ob_shapes9 = []
         if show_ob and not of_df9.empty:
             _t_max9 = of_df9["timestamp"].iloc[-1]
@@ -482,7 +885,7 @@ def render():
                     line=dict(color="#ff3d57", width=1.2),
                 ))
 
-        # ── Key horizontal lines (spot, S&R) ───────────────────────────
+        # Spot + S&R lines
         fig9.add_hline(
             y=spot_t9, line_color="#ff8c00", line_dash="dot", line_width=1.4,
             row=1, col=1,
@@ -507,44 +910,39 @@ def render():
                 annotation_position="right",
             )
 
-        # ── Equal High/Low lines ────────────────────────────────────────
+        # Equal High/Low
         eq_shapes9 = []
         eq_annots9 = []
         if show_eqlev:
             for _eh in eq_highs9:
                 eq_shapes9.append(dict(
-                    type="line", xref="paper", yref="y",
-                    x0=0, x1=1,
+                    type="line", xref="paper", yref="y", x0=0, x1=1,
                     y0=_eh["level"], y1=_eh["level"],
                     line=dict(color="#ff8c00", width=0.8, dash="dashdot"),
                 ))
                 eq_annots9.append(dict(
                     xref="paper", yref="y", x=1.005, y=_eh["level"],
-                    text=f"EQH {_eh['level']:,.0f}", showarrow=False,
-                    xanchor="left",
+                    text=f"EQH {_eh['level']:,.0f}", showarrow=False, xanchor="left",
                     font=dict(color="#ff8c00", size=8, family="JetBrains Mono"),
                 ))
             for _el in eq_lows9:
                 eq_shapes9.append(dict(
-                    type="line", xref="paper", yref="y",
-                    x0=0, x1=1,
+                    type="line", xref="paper", yref="y", x0=0, x1=1,
                     y0=_el["level"], y1=_el["level"],
                     line=dict(color="#00d4ff", width=0.8, dash="dashdot"),
                 ))
                 eq_annots9.append(dict(
                     xref="paper", yref="y", x=1.005, y=_el["level"],
-                    text=f"EQL {_el['level']:,.0f}", showarrow=False,
-                    xanchor="left",
+                    text=f"EQL {_el['level']:,.0f}", showarrow=False, xanchor="left",
                     font=dict(color="#00d4ff", size=8, family="JetBrains Mono"),
                 ))
 
-        # ── BOS / CHoCH annotations ────────────────────────────────────
+        # BOS / CHoCH annotations
         bos_annots9 = []
         if show_bos:
             for _bev in bos9:
                 bos_annots9.append(dict(
-                    x=_bev["time"], y=_bev["price"],
-                    xref="x", yref="y",
+                    x=_bev["time"], y=_bev["price"], xref="x", yref="y",
                     text=_bev["label"], showarrow=True, arrowhead=2,
                     arrowcolor="#00d4ff",
                     font=dict(color="#00d4ff", size=9, family="JetBrains Mono"),
@@ -553,8 +951,7 @@ def render():
                 ))
             for _cev in choch9:
                 bos_annots9.append(dict(
-                    x=_cev["time"], y=_cev["price"],
-                    xref="x", yref="y",
+                    x=_cev["time"], y=_cev["price"], xref="x", yref="y",
                     text=_cev["label"], showarrow=True, arrowhead=2,
                     arrowcolor="#c084fc",
                     font=dict(color="#c084fc", size=9, family="JetBrains Mono"),
@@ -567,43 +964,37 @@ def render():
         if all_shapes9: fig9.update_layout(shapes=all_shapes9)
         if all_annots9: fig9.update_layout(annotations=all_annots9)
 
-        # ── ROW 2: Volume bars + normalised Delta overlay ───────────────
-        _vcols9 = [
-            "#00e676" if c >= o else "#ff3d57"
-            for c, o in zip(of_df9["close"], of_df9["open"])
-        ]
+        # ── Row 2: Volume + Delta overlay ─────────────────────────────
+        _vcols9 = ["#00e676" if c >= o else "#ff3d57"
+                   for c, o in zip(of_df9["close"], of_df9["open"])]
         fig9.add_trace(go.Bar(
             x=of_df9["timestamp"], y=of_df9["volume"],
             marker_color=_vcols9, name="Volume",
             showlegend=False, opacity=0.7,
         ), row=2, col=1)
 
-        # Normalise delta to 40% of max volume scale for visual overlay
         if "delta" in of_df9.columns:
-            _dmax9  = float(of_df9["volume"].max()) or 1.0
+            _dmax9   = float(of_df9["volume"].max()) or 1.0
             _dabsmax = float(of_df9["delta"].abs().max()) or 1.0
             _dnorm9  = of_df9["delta"] / _dabsmax * _dmax9 * 0.4
             _dcols9  = ["#00e676" if v >= 0 else "#ff3d57" for v in of_df9["delta"]]
             fig9.add_trace(go.Bar(
                 x=of_df9["timestamp"], y=_dnorm9,
                 marker_color=_dcols9, name="Delta",
-                opacity=0.55, showlegend=True,
+                opacity=0.55,
             ), row=2, col=1)
 
-        # ── ROW 3 (optional): Cumulative Delta ─────────────────────────
-        # FIX 6 & 8 ▸ guard cum_delta column existence; simplify last-value access
+        # ── Row 3 (optional): Cumulative Delta ────────────────────────
         if show_delta and "cum_delta" in of_df9.columns:
-            _cd_last = of_df9["cum_delta"].iloc[-1]          # FIX 6: was unused list
+            _cd_last = of_df9["cum_delta"].iloc[-1]
             _cd_col  = "#00e676" if _cd_last >= 0 else "#ff3d57"
             fig9.add_trace(go.Scatter(
                 x=of_df9["timestamp"], y=of_df9["cum_delta"],
                 mode="lines", name="Cum Delta",
                 line=dict(color=_cd_col, width=2),
                 fill="tozeroy",
-                fillcolor=(
-                    "rgba(0,230,118,0.10)" if _cd_col == "#00e676"
-                    else "rgba(255,61,87,0.10)"
-                ),
+                fillcolor="rgba(0,230,118,0.10)" if _cd_col == "#00e676"
+                          else "rgba(255,61,87,0.10)",
             ), row=3, col=1)
             fig9.add_hline(y=0, line_color="#3a6080", line_dash="dot",
                            line_width=0.8, row=3, col=1)
@@ -616,30 +1007,24 @@ def render():
                     mode="lines", name="RSI(14)",
                     line=dict(color="#c084fc", width=1.8),
                 ), row=_cum_row, col=1)
-                for _yl9, _yc9, _yd9 in [
-                    (70, "#ff3d57", "dash"),
-                    (50, "#3a6080", "dot"),
-                    (30, "#00e676", "dash"),
-                ]:
+                for _yl9, _yc9, _yd9 in [(70, "#ff3d57", "dash"),
+                                          (50, "#3a6080", "dot"),
+                                          (30, "#00e676", "dash")]:
                     fig9.add_hline(y=_yl9, line_color=_yc9, line_dash=_yd9,
                                    line_width=0.7, row=_cum_row, col=1)
-
             if show_macd and "macd_hist" in of_df9.columns:
                 _mhcols9 = ["#00e676" if v >= 0 else "#ff3d57" for v in of_df9["macd_hist"]]
                 fig9.add_trace(go.Bar(
                     x=of_df9["timestamp"], y=of_df9["macd_hist"],
                     marker_color=_mhcols9, name="MACD Hist",
-                    opacity=0.55, showlegend=True,
+                    opacity=0.55,
                 ), row=_cum_row, col=1)
 
-        # ── Global layout ──────────────────────────────────────────────
-        _chart_height = (
-            820 if (show_delta and _show_indicator_row) else
-            680 if (show_delta or _show_indicator_row) else
-            520
-        )
+        # ── Layout ─────────────────────────────────────────────────────
+        _chart_h = (820 if (show_delta and _show_indicator_row) else
+                    680 if (show_delta or _show_indicator_row) else 520)
         fig9.update_layout(
-            height=_chart_height,
+            height=_chart_h,
             paper_bgcolor="#070b0f",
             plot_bgcolor="#070b0f",
             font=dict(family="JetBrains Mono", color="#7fa8c8", size=10),
@@ -647,20 +1032,13 @@ def render():
             legend=dict(
                 bgcolor="rgba(7,11,15,0.88)", bordercolor="#1e3040",
                 borderwidth=1, font=dict(color="#7fa8c8", size=9),
-                orientation="h", yanchor="bottom", y=1.01,
-                xanchor="left", x=0,
+                orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0,
             ),
             xaxis_rangeslider_visible=False,
             barmode="overlay",
         )
-
-        # Suppress rangeslider on all x-axes
-        _ax_common = dict(
-            rangeslider_visible=False,
-            gridcolor="#1a2a3a",
-            showgrid=True,
-            zeroline=False,
-        )
+        _ax_common = dict(rangeslider_visible=False, gridcolor="#1a2a3a",
+                          showgrid=True, zeroline=False)
         for _xi in ["xaxis", "xaxis2", "xaxis3", "xaxis4"]:
             try:
                 fig9.update_layout(**{_xi: _ax_common})
@@ -668,26 +1046,19 @@ def render():
                 pass
         fig9.update_xaxes(**_ax_common)
         fig9.update_yaxes(gridcolor="#1a2a3a", showgrid=True, zeroline=False)
-
         fig9.update_yaxes(title_text="Price (₹)", tickformat=",.0f",
                           side="right", row=1, col=1)
         fig9.update_yaxes(title_text="Vol/Delta", row=2, col=1)
         if show_delta and "cum_delta" in of_df9.columns:
             fig9.update_yaxes(title_text="Cum Δ", row=3, col=1)
-
-        # FIX 7 ▸ guard RSI y-axis update — was crashing when RSI+MACD off
-        #          but delta on (_cum_row=4, only 3 rows existed)
         if _show_indicator_row:
             fig9.update_yaxes(title_text="RSI", range=[0, 100],
                               row=_cum_row, col=1)
 
         st.plotly_chart(
             fig9, use_container_width=True,
-            config={
-                "scrollZoom": True,
-                "displayModeBar": True,
-                "modeBarButtonsToRemove": ["autoScale2d"],
-            },
+            config={"scrollZoom": True, "displayModeBar": True,
+                    "modeBarButtonsToRemove": ["autoScale2d"]},
         )
 
     except ImportError:
@@ -698,7 +1069,7 @@ def render():
         st.code(traceback.format_exc())
 
     # ─────────────────────────────────────────────────────────────────────
-    # 💧 LIQUIDITY SWEEP TABLE
+    # LIQUIDITY SWEEP TABLE
     # ─────────────────────────────────────────────────────────────────────
     st.markdown("---")
     ls1, ls2, ls3, ls4 = st.columns(4)
@@ -779,11 +1150,8 @@ def render():
 
     with ls3:
         section_header("🧱 Order Blocks", "ICT supply/demand zones")
-        _all_obs = sorted(
-            bull_obs9 + bear_obs9,
-            key=lambda x: str(x.get("time", "")),
-            reverse=True,
-        )
+        _all_obs = sorted(bull_obs9 + bear_obs9,
+                          key=lambda x: str(x.get("time", "")), reverse=True)
         for _ob in _all_obs:
             _oc = "#00e676" if _ob["type"] == "BULL_OB" else "#ff3d57"
             _ol = "BULL OB" if _ob["type"] == "BULL_OB" else "BEAR OB"
@@ -794,16 +1162,13 @@ def render():
               <div style="font-family:'Barlow Condensed',sans-serif;font-size:10px;
                           color:{_oc};letter-spacing:1px;">{_ol}</div>
               <div style="font-family:'JetBrains Mono',monospace;font-size:12px;
-                          color:#e8f4ff;">
-                {_ob["bot"]:,.0f}  –  {_ob["top"]:,.0f}</div>
+                          color:#e8f4ff;">{_ob["bot"]:,.0f}  –  {_ob["top"]:,.0f}</div>
               <div style="font-family:'JetBrains Mono',monospace;font-size:10px;
                           color:#3a6080;">{str(_ob["time"])[-8:]}</div>
             </div>""", unsafe_allow_html=True)
         if not bull_obs9 and not bear_obs9:
-            st.markdown(
-                "<div style='color:#3a6080;font-size:12px;'>No order blocks found</div>",
-                unsafe_allow_html=True,
-            )
+            st.markdown("<div style='color:#3a6080;font-size:12px;'>No order blocks found</div>",
+                        unsafe_allow_html=True)
 
     with ls4:
         section_header("🔵 BOS / CHoCH", "Structure breaks & character changes")
@@ -821,12 +1186,12 @@ def render():
                           color:#3a6080;">{str(_ev["time"])[-8:]}</div>
             </div>""", unsafe_allow_html=True)
         if not bos9 and not choch9:
-            st.markdown(
-                "<div style='color:#3a6080;font-size:12px;'>No structure breaks found</div>",
-                unsafe_allow_html=True,
-            )
+            st.markdown("<div style='color:#3a6080;font-size:12px;'>No structure breaks found</div>",
+                        unsafe_allow_html=True)
 
-    # ── FVG table ──────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
+    # FVG TABLE
+    # ─────────────────────────────────────────────────────────────────────
     st.markdown("---")
     section_header("🟡 Fair Value Gaps  (Imbalances)",
                    "Price tends to return to fill these gaps")
@@ -849,11 +1214,8 @@ def render():
                     size: {_sz:.1f} pts | {str(_fg["time"])[-8:]}</span>
                 </div>""", unsafe_allow_html=True)
         else:
-            st.markdown(
-                "<div style='color:#3a6080;font-size:12px;'>None detected</div>",
-                unsafe_allow_html=True,
-            )
-
+            st.markdown("<div style='color:#3a6080;font-size:12px;'>None detected</div>",
+                        unsafe_allow_html=True)
     with fg2:
         st.markdown(
             '<div style="font-family:\'Barlow Condensed\',sans-serif;font-size:11px;'
@@ -872,24 +1234,44 @@ def render():
                     size: {_sz:.1f} pts | {str(_fg["time"])[-8:]}</span>
                 </div>""", unsafe_allow_html=True)
         else:
-            st.markdown(
-                "<div style='color:#3a6080;font-size:12px;'>None detected</div>",
-                unsafe_allow_html=True,
-            )
+            st.markdown("<div style='color:#3a6080;font-size:12px;'>None detected</div>",
+                        unsafe_allow_html=True)
 
-    # ── Bottom indicator summary cards ─────────────────────────────────────
+    # ═════════════════════════════════════════════════════════════════════
+    # ⚡ FVG AUTO-TRADE ENGINE  (integrated below FVG table)
+    # ═════════════════════════════════════════════════════════════════════
     st.markdown("---")
-    _rc9 = (
-        "#ff3d57" if ts9.get("rsi14", 50) > 70
-        else "#00e676" if ts9.get("rsi14", 50) < 30
-        else "#c084fc"
+    _cur_expiry = st.session_state.get("current_selected_expiry", "")
+
+    _render_fvg_auto_trade(
+        bull_fvgs      = bull_fvg9,
+        bear_fvgs      = bear_fvg9,
+        of_df9         = of_df9,
+        spot           = spot_t9,
+        index_key      = sel_t9,
+        expiry         = _cur_expiry,
+        place_order_fn = None,   # ← swap in your broker API wrapper here
+        #
+        # Example with real orders:
+        # place_order_fn = lambda action, strike, idx: your_place_order_fn(
+        #     symbol    = f"{idx}{_cur_expiry}{strike}{'PE' if action=='SELL_PE' else 'CE'}",
+        #     qty       = get_lot_size(idx),
+        #     side      = "SELL",
+        #     order_type= "MARKET",
+        # ),
     )
+
+    # ─────────────────────────────────────────────────────────────────────
+    # INDICATOR SUMMARY CARDS
+    # ─────────────────────────────────────────────────────────────────────
+    st.markdown("---")
+    _rc9 = ("#ff3d57" if ts9.get("rsi14", 50) > 70
+            else "#00e676" if ts9.get("rsi14", 50) < 30
+            else "#c084fc")
     _mc9 = "#00e676" if ts9.get("macd_cross") == "BULLISH" else "#ff3d57"
-    _ec9 = (
-        "#00e676" if ts9.get("ema_trend") == "BULLISH"
-        else "#ff3d57" if ts9.get("ema_trend") == "BEARISH"
-        else "#ffd600"
-    )
+    _ec9 = ("#00e676" if ts9.get("ema_trend") == "BULLISH"
+            else "#ff3d57" if ts9.get("ema_trend") == "BEARISH"
+            else "#ffd600")
     _vc9 = "#00e676" if ts9.get("price_vs_vwap") == "ABOVE" else "#ff3d57"
 
     metrics_row(
