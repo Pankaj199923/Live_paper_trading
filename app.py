@@ -31,7 +31,7 @@ import tab9_chart
 # import tab10_history
 import tab11_basket
 import tab12_paper_trading
-import tab13_WIRING_PATCH
+# import tab13_WIRING_PATCH
 
 st.set_page_config(
     page_title="QuantDesk Pro | Options Terminal",
