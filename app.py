@@ -365,7 +365,7 @@ def render_header():
 # ======================
 render_header()
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab8, tab9, tab11, tab12, tab13 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab8, tab9, tab11, tab12 = st.tabs([
     "OPTION CHAIN",
     "SMART MONEY",
     "POSITIONS",
@@ -377,7 +377,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab8, tab9, tab11, tab12, tab13 = st.tabs([
     # "\U0001f4f8 HISTORY",
     "\U0001f9fa BASKET",
     "\U0001f3ae PAPER_Trade",
-    "\U0001f3ae FVG LOG",
+    # "\U0001f3ae FVG LOG",
 ])
 
 with tab1:  tab1_option_chain.render()
@@ -392,4 +392,4 @@ with tab9:  tab9_chart.render()
 # with tab10: tab10_history.render()
 with tab11: tab11_basket.render()
 with tab12: tab12_paper_trading.render()
-with tab13: tab13_WIRING_PATCH.render()  
+
