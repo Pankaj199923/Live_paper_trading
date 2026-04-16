@@ -27,7 +27,7 @@ import tab3_positions
 import tab4_snr_pain
 import tab5_ai_advisor
 import tab6_trade_log
-import tab7_greeks_lab
+# import tab7_greeks_lab
 import tab8_stocks
 import tab9_chart
 import tab10_history
@@ -577,7 +577,6 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12 = st.t
     "S&R / PAIN",
     "AI ADVISOR",
     "TRADE LOG",
-    "GREEKS LAB",
     "\U0001f5a5 STOCKS",
     "\U0001f4ca CHART",
     "\U0001f4f8 HISTORY",
@@ -591,7 +590,7 @@ with tab3:  tab3_positions.render()
 with tab4:  tab4_snr_pain.render()
 with tab5:  tab5_ai_advisor.render()
 with tab6:  tab6_trade_log.render()
-with tab7:  tab7_greeks_lab.render()
+# with tab7:  tab7_greeks_lab.render()
 with tab8:  tab8_stocks.render()
 with tab9:  tab9_chart.render()
 with tab10: tab10_history.render()
