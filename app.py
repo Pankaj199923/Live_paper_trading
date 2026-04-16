@@ -1,5 +1,6 @@
 # ============================================================
 # app.py  —  QuantDesk Pro | Main Entry Point
+# FIXES: Dynamic session label, circular refresh timer, sticky header+tabs
 # ============================================================
 import streamlit as st
 import pandas as pd
@@ -76,16 +77,33 @@ html, body, .stApp {
 
 /* ── Hide Streamlit chrome ── */
 #MainMenu, footer, header { visibility: hidden; }
-.block-container { padding: 0.5rem 1rem 2rem !important; max-width: 100% !important; }
+.block-container { padding: 0rem 1rem 2rem !important; max-width: 100% !important; }
 .stDeployButton { display: none; }
 
-/* ── Tabs — Bloomberg style ── */
+/* ═══════════════════════════════════════════
+   STICKY HEADER + TABS
+   ═══════════════════════════════════════════ */
+
+/* Make the sticky wrapper stick to top */
+.sticky-topbar {
+  position: sticky !important;
+  top: 0 !important;
+  z-index: 9999 !important;
+  background: var(--bg-primary) !important;
+}
+
+/* Streamlit's tab list — make it sticky */
 .stTabs [data-baseweb="tab-list"] {
+  position: sticky !important;
+  top: 0 !important;
+  z-index: 9998 !important;
   background: var(--bg-secondary) !important;
   border-bottom: 1px solid var(--border-bright) !important;
   gap: 0 !important;
   padding: 0 !important;
 }
+
+/* ── Tabs ── */
 .stTabs [data-baseweb="tab"] {
   background: transparent !important;
   color: var(--text-secondary) !important;
@@ -94,9 +112,10 @@ html, body, .stApp {
   font-weight: 600 !important;
   letter-spacing: 1px !important;
   text-transform: uppercase !important;
-  padding: 10px 20px !important;
+  padding: 10px 18px !important;
   border: none !important;
   border-right: 1px solid var(--border) !important;
+  white-space: nowrap !important;
 }
 .stTabs [aria-selected="true"] {
   background: var(--bg-card) !important;
@@ -138,7 +157,6 @@ html, body, .stApp {
   font-family: var(--font-mono) !important;
   font-size: 12px !important;
 }
-iframe[title="st_aggrid"] { background: var(--bg-card) !important; }
 
 /* ── Buttons ── */
 .stButton > button {
@@ -218,22 +236,105 @@ iframe[title="st_aggrid"] { background: var(--bg-card) !important; }
 
 /* ── Divider ── */
 hr { border-color: var(--border) !important; margin: 12px 0 !important; }
+
+/* ═══════════════════════════════════════════
+   CIRCULAR REFRESH RING
+   ═══════════════════════════════════════════ */
+@keyframes ring-countdown {
+  0%   { stroke-dasharray: 100 0;  }
+  100% { stroke-dasharray: 0   100; }
+}
+@keyframes ring-pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.6; }
+}
+.refresh-ring-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 16px;
+}
+.refresh-ring {
+  position: relative;
+  width: 34px;
+  height: 34px;
+  flex-shrink: 0;
+}
+.refresh-ring svg {
+  transform: rotate(-90deg);
+  width: 34px;
+  height: 34px;
+}
+.refresh-ring .track {
+  fill: none;
+  stroke: #1e3040;
+  stroke-width: 3;
+}
+.refresh-ring .progress {
+  fill: none;
+  stroke: #ff8c00;
+  stroke-width: 3;
+  stroke-linecap: round;
+  stroke-dasharray: 100 0;
+  animation: ring-countdown 5s linear infinite;
+  transition: stroke 0.3s;
+}
+.refresh-ring .center-dot {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 8px;
+  font-weight: 700;
+  color: #ff8c00;
+  pointer-events: none;
+  animation: ring-pulse 5s linear infinite;
+}
+.refresh-label {
+  font-family: 'Barlow Condensed', sans-serif;
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  color: #3a6080;
+  text-transform: uppercase;
+  line-height: 1.2;
+}
+.refresh-label span {
+  display: block;
+  font-size: 10px;
+  color: #ff8c00;
+  font-weight: 700;
+}
+
+/* ═══════════════════════════════════════════
+   SESSION BADGE
+   ═══════════════════════════════════════════ */
+.session-live {
+  animation: session-glow 2s ease-in-out infinite;
+}
+@keyframes session-glow {
+  0%, 100% { text-shadow: 0 0 8px rgba(0,230,118,0.6); }
+  50%       { text-shadow: 0 0 20px rgba(0,230,118,1); }
+}
+.session-pre {
+  animation: session-amber 3s ease-in-out infinite;
+}
+@keyframes session-amber {
+  0%, 100% { text-shadow: 0 0 6px rgba(255,214,0,0.4); }
+  50%       { text-shadow: 0 0 14px rgba(255,214,0,0.9); }
+}
 </style>
 """, unsafe_allow_html=True)
 
-# ======================
 
 # ======================
-# 🔄 AUTO REFRESH — only fires outside chart tab
+# 🔄 AUTO REFRESH
 # ======================
-# st_autorefresh triggers a full Streamlit rerun every N ms.
-# Chart tab uses st.fragment to isolate itself from global reruns.
 _active_tab = st.session_state.get("active_tab_key", "OPTION CHAIN")
 _skip_refresh = _active_tab in ("📊 CHART",)
 if not _skip_refresh:
     st_autorefresh(interval=5000, key="datarefresh")
 else:
-    # Still refresh header/spot data but skip expensive full rerun
     st_autorefresh(interval=30000, key="datarefresh_slow")
 
 
@@ -264,19 +365,46 @@ defaults = {
     "last_snapshot_time": lambda: None,
     "strategy_builder":   lambda: [],
     "header_prev_spots":  lambda: {},
+    "_refresh_count":     lambda: 0,
 }
 for key, factory in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = factory()
+
+# Increment refresh counter for tracking
+st.session_state["_refresh_count"] = st.session_state.get("_refresh_count", 0) + 1
+
+
+# ======================
+# 🕒 DYNAMIC SESSION LABEL — Recomputed every render (fixes PRE-MARKET bug)
+# ======================
+def get_live_session():
+    """Always compute current session from real-time IST clock."""
+    _now = datetime.now(IST).time()
+    _OPEN  = dtime(9, 15)   # NSE actual open
+    _CLOSE = dtime(15, 30)
+    _PRE   = dtime(8, 59)   # Pre-market OI data available
+
+    if _now < _PRE:
+        return "CLOSED",     "#3a6080",  False
+    elif _now < _OPEN:
+        return "PRE-MARKET", "#ffd600",  False
+    elif _now <= _CLOSE:
+        return "LIVE",       "#00e676",  True
+    else:
+        return "POST-MARKET","#7fa8c8",  False
 
 
 # ======================
 # ── PRO HEADER BAR ──
 # ======================
 def render_header():
-    # ── Always fetch live prices for ALL indices via API (cached ttl=5s) ──
-    spot_vals = {}
+    # Live session — always fresh
+    live_label, live_color, is_market_open = get_live_session()
+    now_str = datetime.now(IST).strftime("%d %b %Y  %H:%M:%S")
 
+    # ── Fetch spot prices ──────────────────────────────────────────
+    spot_vals = {}
     try:
         all_keys = ",".join(df_indices['index'].tolist())
         r = requests.get(
@@ -290,34 +418,30 @@ def render_header():
             clean = raw_key.replace("%7C", "|").replace("%7c", "|")
             price = v.get("last_price", 0)
             if price > 0:
-                # Direct key match
                 if clean in INDEX_SHORT:
                     spot_vals[clean] = price
-                # Partial key match (Upstox sometimes returns modified keys)
                 for idx_key in INDEX_SHORT:
                     if idx_key.split("|")[-1].lower() in clean.lower():
                         spot_vals[idx_key] = price
-                        # Also keep session state in sync for other tabs
                         st.session_state[f"spot_{idx_key}"] = price
     except Exception:
         pass
 
-    # ── Fallback: use session state if API call failed ────────────────────
+    # Fallback to session cache
     if not spot_vals:
         for idx_key in INDEX_SHORT:
-            cached_spot = st.session_state.get(f"spot_{idx_key}", 0)
-            if cached_spot > 0:
-                spot_vals[idx_key] = cached_spot
+            cached = st.session_state.get(f"spot_{idx_key}", 0)
+            if cached > 0:
+                spot_vals[idx_key] = cached
 
-    # ── Persist prev spots for change % across refreshes ────────────────
+    # Track prev spots for change %
     prev_spots = st.session_state.get("header_prev_spots", {})
-    if spot_vals:
-        updated = {}
-        for k in INDEX_SHORT:
-            updated[k] = spot_vals.get(k, 0) or prev_spots.get(k, 0)
-        st.session_state["header_prev_spots"] = updated
+    updated = {}
+    for k in INDEX_SHORT:
+        updated[k] = spot_vals.get(k, 0) or prev_spots.get(k, 0)
+    st.session_state["header_prev_spots"] = updated
 
-    # ── Build ticker blocks ───────────────────────────────────────────────
+    # ── Build ticker blocks ────────────────────────────────────────
     ticker_blocks = []
     for idx_key, idx_short_name in INDEX_SHORT.items():
         price   = spot_vals.get(idx_key, 0)
@@ -329,35 +453,116 @@ def render_header():
         disp    = f"{price:,.0f}" if price > 0 else "&mdash;"
         chg_str = f"{arrow} {abs(chg_pct):.2f}%" if price > 0 else "&mdash;"
         ticker_blocks.append(
-            f'<div style="display:flex;flex-direction:column;padding:0 18px;border-right:1px solid #1e3040;min-width:110px;">'
-            f'<span style="font-family:Barlow Condensed,sans-serif;font-size:10px;letter-spacing:1.5px;color:#7fa8c8;font-weight:600;">{idx_short_name}</span>'
-            f'<span style="font-family:JetBrains Mono,monospace;font-size:16px;font-weight:700;color:#e8f4ff;">{disp}</span>'
-            f'<span style="font-family:JetBrains Mono,monospace;font-size:11px;color:{col};">{chg_str}</span>'
+            f'<div style="display:flex;flex-direction:column;padding:0 16px;'
+            f'border-right:1px solid #1e3040;min-width:100px;">'
+            f'<span style="font-family:Barlow Condensed,sans-serif;font-size:9px;'
+            f'letter-spacing:1.5px;color:#7fa8c8;font-weight:600;">{idx_short_name}</span>'
+            f'<span style="font-family:JetBrains Mono,monospace;font-size:15px;'
+            f'font-weight:700;color:#e8f4ff;">{disp}</span>'
+            f'<span style="font-family:JetBrains Mono,monospace;font-size:10px;color:{col};">{chg_str}</span>'
             f'</div>'
         )
     tickers_html = "".join(ticker_blocks)
 
-    now_str = datetime.now(IST).strftime("%d %b %Y  %H:%M:%S")
-    header_html = (
-        '<div style="background:linear-gradient(90deg,#0d1117,#111920);border-bottom:1px solid #2a4560;'
-        'border-left:3px solid #ff8c00;padding:8px 0;display:flex;align-items:center;'
-        'justify-content:space-between;margin:-0.5rem -1rem 12px -1rem;">'
-        '<div style="display:flex;align-items:center;">'
-        '<div style="padding:0 20px;border-right:1px solid #1e3040;">'
-        '<span style="font-family:Barlow Condensed,sans-serif;font-size:20px;font-weight:800;letter-spacing:2px;color:#ff8c00;">QUANTDESK</span>'
-        '<span style="font-family:Barlow Condensed,sans-serif;font-size:12px;letter-spacing:3px;color:#7fa8c8;margin-left:6px;">PRO</span>'
-        '</div>'
-        + tickers_html +
-        '</div>'
-        f'<div style="padding:0 20px;text-align:right;">'
-        f'<div style="font-size:10px;letter-spacing:1px;color:#7fa8c8;font-family:Barlow Condensed,sans-serif;">SESSION</div>'
-        f'<div style="font-size:14px;font-weight:700;color:{session_color};letter-spacing:2px;">{session_label}</div>'
-        f'<div style="font-size:11px;color:#3a6080;">{now_str} IST</div>'
-        '</div>'
-        '</div>'
-    )
+    # ── Session badge CSS class ────────────────────────────────────
+    sess_class = "session-live" if live_label == "LIVE" else "session-pre" if live_label == "PRE-MARKET" else ""
+    sess_dot   = "●" if live_label == "LIVE" else "◑" if live_label == "PRE-MARKET" else "○"
+
+    # ── Circular refresh ring (pure CSS animation, resets on rerun) ──
+    ring_html = """
+    <div class="refresh-ring-wrap">
+      <div class="refresh-ring">
+        <svg viewBox="0 0 36 36" xmlns="http://www.w3.org/2000/svg">
+          <circle class="track"    cx="18" cy="18" r="15.9"/>
+          <circle class="progress" cx="18" cy="18" r="15.9"/>
+        </svg>
+        <div class="center-dot">5s</div>
+      </div>
+      <div class="refresh-label">
+        AUTO<span>REFRESH</span>
+      </div>
+    </div>
+    """
+
+    # ── Full header HTML ───────────────────────────────────────────
+    header_html = f"""
+<div class="sticky-topbar">
+  <div style="background:linear-gradient(90deg,#0a0f14,#111920,#0a0f14);
+              border-bottom:2px solid #1e3040;
+              border-left:3px solid #ff8c00;
+              padding:6px 0;
+              display:flex;align-items:center;justify-content:space-between;">
+
+    <!-- LEFT: Brand -->
+    <div style="display:flex;align-items:center;">
+      <div style="padding:0 18px;border-right:1px solid #1e3040;min-width:130px;">
+        <span style="font-family:Barlow Condensed,sans-serif;font-size:21px;
+                     font-weight:800;letter-spacing:2px;color:#ff8c00;">QUANTDESK</span>
+        <span style="font-family:Barlow Condensed,sans-serif;font-size:11px;
+                     letter-spacing:3px;color:#7fa8c8;margin-left:5px;">PRO</span>
+      </div>
+
+      <!-- TICKERS -->
+      <div style="display:flex;align-items:center;overflow-x:auto;scrollbar-width:none;">
+        {tickers_html}
+      </div>
+    </div>
+
+    <!-- RIGHT: Refresh ring + Session + Time -->
+    <div style="display:flex;align-items:center;gap:0;padding-right:4px;">
+      <!-- Circular Refresh Ring -->
+      {ring_html}
+
+      <!-- Divider -->
+      <div style="width:1px;height:40px;background:#1e3040;margin:0 12px;"></div>
+
+      <!-- Session -->
+      <div style="text-align:right;padding-right:16px;">
+        <div style="font-family:Barlow Condensed,sans-serif;font-size:9px;
+                    letter-spacing:1.5px;color:#7fa8c8;">SESSION</div>
+        <div class="{sess_class}" style="font-family:Barlow Condensed,sans-serif;
+                    font-size:16px;font-weight:800;letter-spacing:2px;color:{live_color};">
+          {sess_dot} {live_label}
+        </div>
+        <div style="font-family:JetBrains Mono,monospace;font-size:9px;
+                    color:#3a6080;margin-top:1px;">{now_str} IST</div>
+      </div>
+    </div>
+  </div>
+</div>
+"""
     st.markdown(header_html, unsafe_allow_html=True)
 
+    # ── JS: Update ring countdown with real elapsed time ──────────
+    # Inject JS to sync the CSS animation phase with actual refresh cycle
+    st.markdown("""
+<script>
+(function() {
+  // Find the progress circle and re-trigger animation in sync
+  const circles = document.querySelectorAll('.refresh-ring .progress');
+  circles.forEach(c => {
+    c.style.animation = 'none';
+    void c.offsetHeight; // reflow
+    c.style.animation = 'ring-countdown 5s linear infinite';
+  });
+  // Also sync center dot
+  const dots = document.querySelectorAll('.refresh-ring .center-dot');
+  dots.forEach(d => {
+    d.style.animation = 'none';
+    void d.offsetHeight;
+    d.style.animation = 'ring-pulse 5s linear infinite';
+  });
+  // Live countdown text in dot
+  let secs = 5;
+  dots.forEach(d => d.textContent = secs + 's');
+  const timer = setInterval(() => {
+    secs--;
+    if (secs <= 0) secs = 5;
+    dots.forEach(d => d.textContent = secs + 's');
+  }, 1000);
+})();
+</script>
+""", unsafe_allow_html=True)
 
 
 # ======================
