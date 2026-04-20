@@ -35,7 +35,7 @@ IST = pytz.timezone("Asia/Kolkata")
 now_ist    = datetime.now(IST).time()
 now_ist_dt = datetime.now(IST)
 
-MARKET_OPEN_TIME  = dtime(9, 19)
+MARKET_OPEN_TIME  = dtime(9, 15)
 MARKET_CLOSE_TIME = dtime(15, 30)
 MARKET_OPEN = MARKET_OPEN_TIME <= now_ist <= MARKET_CLOSE_TIME
 
