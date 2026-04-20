@@ -85,8 +85,36 @@ def _get_anthropic_client() -> _ant.Anthropic:
 
 
 # ─────────────────────────────────────────────────────────────
-# FIX A: Strike-indexed DataFrame helper
-# Builds a Strike→row index once per render and reuses everywhere.
+# FIX D: CACHED SIGNAL + TECHNICALS COMPUTATION
+# These are the two most expensive operations in the tab — an API
+# call (fetch_intraday_candles) plus heavy pandas computation
+# (compute_technicals, compute_signal_score).
+# Without caching they re-run on EVERY Streamlit rerun (every
+# button click, widget change, etc.) making the tab very slow.
+# TTL=60s means data refreshes every minute while staying fast.
+# ─────────────────────────────────────────────────────────────
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_technicals(index_key: str, tf: str = "5minute"):
+    """Fetch candles + compute technicals, cached 60 s."""
+    try:
+        candles = fetch_intraday_candles(index_key, tf)
+        tech_df, tech_sum = compute_technicals(candles)
+        return tech_sum
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_signals(oc_hash: str, spot: float, index_key: str,
+                    oc_df_json: str):
+    """Compute signal scores, cached 60 s per (oc_hash, spot, index)."""
+    try:
+        oc_df = pd.read_json(oc_df_json)
+        bull_s, bear_s, pcr_v, pcr_chg, res_s, sup_s, _ = compute_signal_score(
+            oc_df, spot, index_key)
+        return bull_s, bear_s, pcr_v
+    except Exception:
+        return 10, 10, 1.0
 # Eliminates all oc_df[oc_df["Strike"] == x] scans (O(n) each)
 # and replaces with O(1) .at[strike, col] lookups.
 # ─────────────────────────────────────────────────────────────
@@ -98,10 +126,13 @@ def _build_oc_index(oc_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _ltp_from_index(oc_idx: pd.DataFrame, strike, opt_type: str, fallback: float = 0.0) -> float:
-    """Safe O(1) LTP lookup from the pre-indexed DataFrame."""
+    """Safe O(1) LTP lookup from the pre-indexed DataFrame.
+    Always coerces strike to float to match the float-keyed index.
+    """
     col = f"{opt_type}_LTP"
     try:
-        return round(float(oc_idx.at[strike, col]), 2)
+        val = oc_idx.at[float(strike), col]
+        return round(float(val), 2) if pd.notna(val) and float(val) > 0 else fallback
     except (KeyError, TypeError, ValueError):
         return fallback
 
@@ -175,16 +206,33 @@ def _execute_paper_trade(
     qty       = lots * lot_size
 
     # FIX A: use pre-built index if available, else build it here
+    # Force strike to float so .at[] lookup always works regardless of int/float source
+    strike = float(strike)
     if oc_idx is None:
-        oc_idx = _build_oc_index(oc_df)
+        oc_idx = _build_oc_index(oc_df.assign(Strike=oc_df["Strike"].astype(float)))
     premium = _ltp_from_index(oc_idx, strike, opt_type)
+
     if premium <= 0:
-        # Fallback: try raw DataFrame (strike might be float-keyed)
-        row = oc_df[oc_df["Strike"] == strike]
+        # Fallback 1: raw DataFrame scan with float comparison
         col_ltp = f"{opt_type}_LTP"
-        premium = round(float(row[col_ltp].values[0]), 2) if not row.empty else 0.0
+        row = oc_df[oc_df["Strike"].astype(float) == strike]
+        if not row.empty:
+            v = row[col_ltp].values[0]
+            premium = round(float(v), 2) if pd.notna(v) and float(v) > 0 else 0.0
+
     if premium <= 0:
-        st.error("LTP is zero — cannot execute.")
+        # Fallback 2: try live fetch from API
+        try:
+            fetched = fetch_ltp(index_key)
+            premium = round(float(fetched), 2) if fetched and float(fetched) > 0 else 0.0
+        except Exception:
+            pass
+
+    if premium <= 0:
+        st.error(
+            f"❌ LTP is zero for {opt_type} {int(strike)} — option chain may not have this strike. "
+            "Try refreshing the option chain from Tab 1."
+        )
         return None
 
     margin    = _estimate_margin(action, premium, strike, lots, lot_size)
@@ -262,9 +310,9 @@ def _close_trade(trade_id: str, oc_df, reason: str = "MANUAL", oc_idx=None):
         return
     trade = trades[idx]
 
-    # FIX A: use pre-built index
+    # FIX A: use pre-built index; ensure float Strike key
     if oc_idx is None:
-        oc_idx = _build_oc_index(oc_df)
+        oc_idx = _build_oc_index(oc_df.assign(Strike=oc_df["Strike"].astype(float)))
     exit_ltp = _ltp_from_index(oc_idx, trade["strike"], trade["opt_type"], trade["ltp"])
 
     if trade["action"] == "BUY":
@@ -308,7 +356,7 @@ def _close_trade(trade_id: str, oc_df, reason: str = "MANUAL", oc_idx=None):
 # ─────────────────────────────────────────────────────────────
 def _update_live_pnl(oc_df, oc_idx=None):
     if oc_idx is None:
-        oc_idx = _build_oc_index(oc_df)
+        oc_idx = _build_oc_index(oc_df.assign(Strike=oc_df["Strike"].astype(float)))
 
     for trade in st.session_state.pt_open_trades:
         ltp = _ltp_from_index(oc_idx, trade["strike"], trade["opt_type"], trade["ltp"])
@@ -438,7 +486,7 @@ def _build_suggest_prompt(
 
     # FIX A: use pre-built index for option chain snapshot
     if oc_idx is None:
-        oc_idx = _build_oc_index(oc_df)
+        oc_idx = _build_oc_index(oc_df.assign(Strike=oc_df["Strike"].astype(float)))
 
     strikes_all = sorted(oc_df["Strike"].unique().tolist())
     atm_pos = strikes_all.index(atm) if atm in strikes_all else len(strikes_all) // 2
@@ -709,7 +757,7 @@ def _render_trade_suggest_section(
             type="primary",
             key="pt_suggest_btn",
         ):
-            with st.spinner("🧠 Claude is analysing your full trading data…"):
+            with st.spinner("🧠 Fetching live data · Analysing option chain · Building AI prompt…"):
                 result = _generate_trade_suggestion(
                     oc_df, spot, index_key, expiry, tech_sum, signal_scores,
                     oc_idx=oc_idx,
@@ -1075,8 +1123,10 @@ def render():
         st.warning("⏳ Load the Option Chain from **Tab 1** first — paper trading needs live data.")
         return
 
-    # ── FIX A: Build indexed DataFrame ONCE — reused everywhere ──────────
-    oc_idx = _build_oc_index(oc_df)
+    # ── FIX A: Build indexed DataFrame ONCE — force float Strike key ────────
+    # Float key ensures .at[strike, col] always matches regardless of whether
+    # the strike value comes in as int or float from selectbox widgets.
+    oc_idx = _build_oc_index(oc_df.assign(Strike=oc_df["Strike"].astype(float)))
 
     # ── FIX B: Live PnL with the pre-built index ──────────────────────────
     _update_live_pnl(oc_df, oc_idx=oc_idx)
@@ -1087,23 +1137,26 @@ def render():
     st.markdown(_header_html(st.session_state.pt_account, open_pnl, closed_pnl),
                 unsafe_allow_html=True)
 
-    # ── FIX C: Compute signals & technicals ONCE for the whole render ─────
-    # Old: computed inside left_col block, then implicitly needed again by
-    #      _render_trade_suggest_section. Now computed once up-front.
+    # ── FIX D: Use cached signal + technicals — no API call on every rerun ──
+    # Build a cheap hash from spot + oc shape so cache invalidates when data changes
+    _signals_status = st.empty()
     try:
-        bull_s, bear_s, pcr_v, pcr_chg, res_s, sup_s, _ = compute_signal_score(
-            oc_df, spot, sel_idx)
-        tech_df, tech_sum = compute_technicals(
-            fetch_intraday_candles(sel_idx, "5minute"))
+        _oc_hash = f"{sel_idx}_{len(oc_df)}_{int(spot)}"
+        _oc_json = oc_df.to_json()
+        _signals_status.caption("⚡ Loading signals…")
+        bull_s, bear_s, pcr_v = _cached_signals(_oc_hash, round(spot, 0), sel_idx, _oc_json)
+        tech_sum = _cached_technicals(sel_idx, "5minute")
         market_flow = (
             "Bullish" if bull_s - bear_s >= 5
             else "Bearish" if bear_s - bull_s >= 5
             else "Range" if abs(bull_s - bear_s) <= 3
             else "Choppy"
         )
+        _signals_status.empty()   # clear the loading caption
     except Exception:
         bull_s, bear_s, pcr_v, market_flow = 10, 10, 1.0, "Range"
         tech_sum = {}
+        _signals_status.empty()
 
     signal_scores = {"bull": bull_s, "bear": bear_s, "pcr": pcr_v, "flow": market_flow}
 
