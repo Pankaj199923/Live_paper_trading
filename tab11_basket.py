@@ -48,9 +48,9 @@ def render():
         return
 
     # ── FIX 1: Build a Strike-indexed lookup dict ONCE per render ────────
-    # Replaces all repeated oc_b[oc_b["Strike"] == k] scans (O(n) each)
-    # with O(1) dict lookups. All downstream code uses oc_lookup instead.
-    oc_lookup = oc_b.set_index("Strike")
+    # Force Strike index to float so .at[k, col] always matches regardless
+    # of whether strikes come in as int or float from widgets.
+    oc_lookup = oc_b.set_index(oc_b["Strike"].astype(float))
 
     atm_b     = get_atm_strike(spot_b, sel_b)
     lot_size_b= get_lot_size(sel_b)
@@ -427,6 +427,9 @@ def render():
         ba1, ba2, ba3 = st.columns(3)
         with ba1:
             if st.button("🚀 EXECUTE BASKET → TRADE LOG", use_container_width=True, type="primary"):
+                # Guard: ensure ai_trade_log exists in session state
+                if "ai_trade_log" not in st.session_state:
+                    st.session_state.ai_trade_log = []
                 now_b  = datetime.now(IST).strftime("%H:%M:%S")
                 today_b= datetime.now().strftime("%Y-%m-%d")
                 for leg in st.session_state.basket_legs:
@@ -449,6 +452,7 @@ def render():
                     })
                 save_list_to_csv(st.session_state.ai_trade_log, AI_LOG_FILE)
                 st.success(f"✅ {len(st.session_state.basket_legs)} legs executed → Trade Log (Tab 6)")
+                st.rerun()
 
         with ba2:
             if st.button("🗑️ CLEAR ALL LEGS", use_container_width=True):
